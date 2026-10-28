@@ -1,0 +1,4 @@
+# Seconds before a dropped item is auto-looted (per item).
+loot-delay-seconds: 300
+# Rows of the shared inventory (1-6).
+rows: 6
