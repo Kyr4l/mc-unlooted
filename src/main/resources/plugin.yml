@@ -2,13 +2,16 @@ name: Unlooted
 main: me.unlooted.Unlooted
 version: ${project.version}
 api-version: 1.12
-description: Auto-loots dropped items after 300s into a shared inventory.
+description: Auto-loots items left on the ground into a shared, self-resizing inventory.
 commands:
   unlooted:
     description: Open the shared unlooted-items inventory.
     aliases: [ul, unlootedbin]
-    usage: /<command>
+    usage: /<command> [page] | /<command> loot [all]
 permissions:
   unlooted.use:
     description: Open the shared inventory
     default: true
+  unlooted.loot:
+    description: Force the auto-loot sweep to run immediately
+    default: op
