@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'pom.xml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Pick version
+        id: version
+        run: |
+          base=$(sed -n 's:.*<revision>\(.*\)</revision>.*:\1:p' pom.xml | head -1)
+          latest=$(git tag -l 'v*' | sed 's/^v//' | sort -V | tail -1)
+          if [ -z "$latest" ] || [ "$(printf '%s\n%s\n' "$latest" "$base" | sort -V | tail -1)" = "$base" ] && [ "$base" != "$latest" ]; then
+            # First release, or pom.xml was raised above the latest release.
+            version=$base
+          else
+            # Otherwise bump the patch number of the latest release.
+            IFS=. read -r major minor patch <<< "$latest"
+            version="$major.$minor.$((patch + 1))"
+          fi
+          echo "Releasing $version (pom base $base, latest tag ${latest:-none})"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: mvn -B -q package -Drevision=${{ steps.version.outputs.version }}
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" "target/Unlooted-$VERSION.jar" \
+            --target "$GITHUB_SHA" \
+            --title "Unlooted $VERSION" \
+            --generate-notes

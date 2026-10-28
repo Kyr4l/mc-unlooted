@@ -41,4 +41,13 @@ Stored items and timers are saved to `plugins/Unlooted/data.yml`.
 mvn package
 ```
 
-The jar is written to `target/Unlooted.jar`.
+The jar is written to `target/Unlooted-<version>.jar`.
+
+## Releases
+
+Every push to `master` that changes the plugin publishes a GitHub release with the built jar.
+
+- The patch number goes up by one each time, so `v0.1.0` is followed by `v0.1.1`, `v0.1.2` and so on.
+- For a bigger step, raise `revision` in `pom.xml`, for example to `0.2.0`. The next release then uses that version.
+- Changes that only touch the README or other files outside `src/` and `pom.xml` do not create a release.
+- A release can also be started by hand from the Actions tab.

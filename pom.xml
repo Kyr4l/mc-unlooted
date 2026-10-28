@@ -3,11 +3,13 @@
     <modelVersion>4.0.0</modelVersion>
     <groupId>me.unlooted</groupId>
     <artifactId>Unlooted</artifactId>
-    <version>1.1.0</version>
+    <version>${revision}</version>
     <packaging>jar</packaging>
     <name>Unlooted</name>
 
     <properties>
+        <!-- Base release version. CI overrides it with -Drevision=<next version>. -->
+        <revision>0.1.0</revision>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -30,7 +32,7 @@
     </dependencies>
 
     <build>
-        <finalName>Unlooted</finalName>
+        <finalName>Unlooted-${revision}</finalName>
         <resources>
             <resource>
                 <directory>src/main/resources</directory>
