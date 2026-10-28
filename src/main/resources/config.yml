@@ -1,4 +1,19 @@
-# Seconds before a dropped item is auto-looted (per item).
+# Per-item timer: seconds a dropped item must lie on the ground, untouched,
+# before it can be auto-looted. The timer only runs while the item's chunk is loaded,
+# and restarts when someone (player, mob or hopper) picks part of the stack up.
 loot-delay-seconds: 300
-# Rows of the shared inventory (1-6).
-rows: 6
+
+# Global loot timer: how often, in seconds, the plugin sweeps the worlds.
+# Each sweep loots every item whose own timer reached loot-delay-seconds, all at once.
+loot-interval-seconds: 60
+
+# The shared inventory resizes itself to fit the looted stacks, in pages of up to 54 slots.
+# Maximum number of pages. 0 = unlimited. When the cap is hit, items stay on the ground.
+max-pages: 0
+
+# Skip items that can never be picked up, such as shop plugin display items.
+ignore-unpickupable-items: true
+
+# Broadcast after a sweep that looted at least one item.
+# {count} = total number of items, {stacks} = number of dropped stacks looted.
+broadcast-message: "&e[Unlooted] &f{count} &eitem(s) were auto-looted. Type &f/unlooted &eto claim them."
