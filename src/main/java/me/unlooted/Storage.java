@@ -62,10 +62,12 @@ final class Storage {
         }
     }
 
-    /** One distinct item. The template has amount 1 and is never handed out directly, only cloned. */
+    /**
+     * One distinct item. The template has amount 1 and is never changed or handed out directly, only
+     * cloned. Its raw data isn't kept separately: it is computed from the template when needed.
+     */
     static final class Group {
         final ItemStack template;
-        final Object fingerprint;
         /** The template's stored form, computed once: a codec string, or the stack for Bukkit serialization. */
         final Object stored;
         final int maxStack;
@@ -74,9 +76,8 @@ final class Storage {
         final String searchText;
         final List<Lot> lots = new ArrayList<Lot>();
 
-        Group(ItemStack template, Object fingerprint, Object stored, int maxStack, String bucket) {
+        Group(ItemStack template, Object stored, int maxStack, String bucket) {
             this.template = template;
-            this.fingerprint = fingerprint;
             this.stored = stored;
             this.maxStack = maxStack;
             this.bucket = bucket;
@@ -168,20 +169,36 @@ final class Storage {
         return stack.getType().name() + ":" + stack.getDurability();
     }
 
-    private Group find(ItemStack one, Object fingerprint) {
+    /**
+     * The group holding exactly this item, or null. Bukkit's isSimilar picks candidates cheaply; for a
+     * candidate, the full raw data of both sides is compared, so items differing only in data Bukkit
+     * can't see (Forge capabilities...) never share a group. The new item's raw data is only computed
+     * once a candidate exists.
+     */
+    private Group find(ItemStack one) {
         List<Group> list = buckets.get(bucketOf(one));
-        if (list != null) {
-            for (Group group : list) {
-                if (codec.sameData(group.template, group.fingerprint, one, fingerprint)) {
-                    return group;
-                }
+        if (list == null) {
+            return null;
+        }
+        boolean computed = false;
+        Object fingerprint = null;
+        for (Group group : list) {
+            if (!group.template.isSimilar(one)) {
+                continue;
+            }
+            if (!computed) {
+                fingerprint = codec.fingerprint(one);
+                computed = true;
+            }
+            if (codec.sameRawData(group.template, fingerprint)) {
+                return group;
             }
         }
         return null;
     }
 
-    private Group newGroup(ItemStack one, Object fingerprint, Object stored) {
-        Group group = new Group(one, fingerprint, stored, codec.maxStackSize(one), bucketOf(one));
+    private Group newGroup(ItemStack one, Object stored) {
+        Group group = new Group(one, stored, codec.maxStackSize(one), bucketOf(one));
         groups.add(group);
         List<Group> list = buckets.get(group.bucket);
         if (list == null) {
@@ -210,13 +227,12 @@ final class Storage {
     boolean add(ItemStack stack, UUID owner, String ownerName, long reservedUntil, int maxGroups, long now, Origin origin) {
         ItemStack one = stack.clone();
         one.setAmount(1);
-        Object fingerprint = codec.fingerprint(one);
-        Group group = find(one, fingerprint);
+        Group group = find(one);
         if (group == null) {
             if (groups.size() >= maxGroups) {
                 return false;
             }
-            group = newGroup(one, fingerprint, codec.encode(one));
+            group = newGroup(one, codec.encode(one));
         }
         normalize(group, now);
         addLot(group, stack.getAmount(), owner, ownerName, reservedUntil, origin);
@@ -389,10 +405,9 @@ final class Storage {
                 }
                 one = one.clone();
                 one.setAmount(1);
-                Object fingerprint = codec.fingerprint(one);
-                Group group = find(one, fingerprint);
+                Group group = find(one);
                 if (group == null) {
-                    group = newGroup(one, fingerprint, stored instanceof String ? stored : codec.encode(one));
+                    group = newGroup(one, stored instanceof String ? stored : codec.encode(one));
                 }
                 Object lots = entry.get("lots");
                 if (lots instanceof List) {

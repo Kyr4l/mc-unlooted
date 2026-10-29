@@ -29,7 +29,7 @@ import java.util.logging.Logger;
  *
  * Every format is checked with a round trip at startup before it is used.
  */
-final class ItemCodec {
+class ItemCodec {
 
     private static final String PAPER = "paper:";
     private static final String NBT = "nbt:";
@@ -151,18 +151,17 @@ final class ItemCodec {
     }
 
     /**
-     * True when two stacks hold the same item with the same data. Bukkit's isSimilar misses data it
-     * doesn't know, such as Forge capabilities, so the raw NBT is compared too when it is available.
-     * NBT compounds compare by content, so key order doesn't matter.
+     * True when the full raw data of a stored template equals a candidate's, given the candidate's
+     * fingerprint. The template's raw data is computed here instead of being kept in memory: templates
+     * never change, so the result is the same every time. NBT compounds compare by content, so key
+     * order doesn't matter. When raw NBT is unavailable, Bukkit's isSimilar (checked by the caller) decides.
      */
-    boolean sameData(ItemStack a, Object fingerprintA, ItemStack b, Object fingerprintB) {
-        if (!a.isSimilar(b)) {
-            return false;
+    boolean sameRawData(ItemStack template, Object candidateFingerprint) {
+        if (candidateFingerprint == null) {
+            return true;
         }
-        if (fingerprintA != null && fingerprintB != null) {
-            return fingerprintA.equals(fingerprintB);
-        }
-        return true;
+        Object stored = fingerprint(template);
+        return stored == null || stored.equals(candidateFingerprint);
     }
 
     /** How many of this item fit in one stack, asking the server itself when possible. */

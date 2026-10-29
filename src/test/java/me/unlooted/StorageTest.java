@@ -188,6 +188,58 @@ public class StorageTest {
         assertTrue(storage.snapshot().contains("nbt:not-decodable-here"));
     }
 
+    /**
+     * A codec whose raw data includes something Bukkit's isSimilar ignores (here the legacy data byte),
+     * standing in for data such as Forge capabilities.
+     */
+    private static ItemCodec hiddenDataCodec() {
+        Logger quiet = Logger.getLogger("test-hidden");
+        quiet.setLevel(java.util.logging.Level.OFF);
+        return new ItemCodec(quiet) {
+            @Override
+            @SuppressWarnings("deprecation")
+            Object fingerprint(ItemStack one) {
+                return one.getData() == null ? null : Byte.valueOf(one.getData().getData());
+            }
+        };
+    }
+
+    @SuppressWarnings("deprecation")
+    private static ItemStack stoneWithHiddenData(int amount, int hidden) {
+        ItemStack stack = new ItemStack(Material.STONE, amount);
+        stack.setData(new org.bukkit.material.MaterialData(Material.STONE, (byte) hidden));
+        return stack;
+    }
+
+    @Test
+    public void itemsDifferingOnlyInHiddenDataNeverShareAnEntry() {
+        Storage hidden = new Storage(hiddenDataCodec());
+        hidden.add(stoneWithHiddenData(5, 1), null, null, 0, Integer.MAX_VALUE, NOW, at(NOW));
+        hidden.add(stoneWithHiddenData(7, 2), null, null, 0, Integer.MAX_VALUE, NOW, at(NOW));
+        hidden.add(stoneWithHiddenData(3, 1), null, null, 0, Integer.MAX_VALUE, NOW, at(NOW));
+        assertEquals(2, hidden.groups().size());
+        assertEquals(8, hidden.groups().get(0).total());
+        assertEquals(7, hidden.groups().get(1).total());
+        assertEquals(1, hidden.groups().get(0).template.getData().getData());
+        assertEquals(2, hidden.groups().get(1).template.getData().getData());
+    }
+
+    @Test
+    public void storedTemplatesAreNeverChangedByMatching() {
+        Storage hidden = new Storage(hiddenDataCodec());
+        hidden.add(stoneWithHiddenData(5, 1), null, null, 0, Integer.MAX_VALUE, NOW, at(NOW));
+        ItemStack before = hidden.groups().get(0).template.clone();
+        for (int i = 0; i < 20; i++) {
+            hidden.add(stoneWithHiddenData(1, i % 3), null, null, 0, Integer.MAX_VALUE, NOW, at(NOW));
+        }
+        ItemStack after = hidden.groups().get(0).template;
+        assertTrue(before.isSimilar(after));
+        assertEquals(before.getAmount(), after.getAmount());
+        assertEquals(before.getData().getData(), after.getData().getData());
+        assertEquals(5 + 7, hidden.groups().get(0).total());
+        assertEquals(5 + 20, hidden.totalItems());
+    }
+
     @Test
     public void messagesFillPlaceholdersAndColors() {
         Messages messages = new Messages();
