@@ -24,9 +24,12 @@ import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.inventory.InventoryPickupItemEvent;
+import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
 import org.bukkit.inventory.Inventory;
+import org.bukkit.inventory.PlayerInventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -63,6 +66,13 @@ import java.util.logging.Level;
  * with the number of stored stacks, split into pages of at most 54 slots.
  */
 public class Unlooted extends JavaPlugin implements Listener {
+
+    /**
+     * Invisible tag at the end of every navigation pane's lore. Players can't type section signs,
+     * so no real item carries it. Anything tagged is a pane and gets removed wherever it escapes to.
+     */
+    private static final String NAV_TAG = "" + ChatColor.RESET + ChatColor.BLACK + ChatColor.DARK_BLUE
+            + ChatColor.DARK_GREEN + ChatColor.DARK_AQUA + ChatColor.RESET;
 
     /** Items per page: five rows. The sixth row is the navigation bar. */
     private static final int PAGE_SLOTS = 45;
@@ -139,6 +149,8 @@ public class Unlooted extends JavaPlugin implements Listener {
     private final List<Object> unreadable = new ArrayList<Object>();
     private boolean rebuilding;
     private boolean compactQueued;
+    /** Stored items pushed out of a page by a sorting tool when the page had no free slot. Folded back in on the next rebuild. */
+    private final List<ItemStack> displaced = new ArrayList<ItemStack>();
     /** Who asked to clear the storage, and when. The clear only happens on a confirm shortly after. */
     private final Map<String, Long> pendingClears = new HashMap<String, Long>();
     private static final long CLEAR_CONFIRM_MS = 30_000L;
@@ -162,6 +174,8 @@ public class Unlooted extends JavaPlugin implements Listener {
 
         applyConfig();
         getServer().getScheduler().runTaskTimer(this, this::save, 20L * 300, 20L * 300);
+        // Sorting mods and other tools can move slots without any click event, so open pages are checked every tick.
+        getServer().getScheduler().runTaskTimer(this, this::guardOpenPages, 1L, 1L);
     }
 
     /** Reads config.yml values into fields and (re)starts the global loot timer if its interval changed. */
@@ -207,6 +221,10 @@ public class Unlooted extends JavaPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onItemSpawn(ItemSpawnEvent e) {
+        if (isNav(e.getEntity().getItemStack())) {
+            e.getEntity().remove();
+            return;
+        }
         timers.put(e.getEntity().getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
     }
 
@@ -340,7 +358,7 @@ public class Unlooted extends JavaPlugin implements Listener {
 
         for (Item item : due) {
             ItemStack stack = item.getItemStack();
-            if (isEmpty(stack)) {
+            if (isEmpty(stack) || isNav(stack)) {
                 timers.remove(item.getUniqueId());
                 item.remove();
                 continue;
@@ -432,11 +450,12 @@ public class Unlooted extends JavaPlugin implements Listener {
             int itemSlots = ((PageHolder) page.getHolder()).itemSlots();
             for (int i = 0; i < itemSlots; i++) {
                 ItemStack stack = page.getItem(i);
-                if (!isEmpty(stack)) {
+                if (!isEmpty(stack) && !isNav(stack)) {
                     contents.add(stack);
                 }
             }
         }
+        contents.addAll(displaced);
         return contents;
     }
 
@@ -456,6 +475,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
 
         pages.clear();
+        displaced.clear();
         int total = (contents.size() + PAGE_SLOTS - 1) / PAGE_SLOTS;
         for (int p = 0; p < total; p++) {
             int from = p * PAGE_SLOTS;
@@ -483,20 +503,121 @@ public class Unlooted extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------ navigation bar
 
     private void fillNavigationBar(Inventory page, int index, int total) {
-        String pageText = "Page " + (index + 1) + "/" + total;
-        ItemStack filler = glassPane("BLACK", 15, ChatColor.GRAY + pageText,
-                ChatColor.DARK_GRAY + "Navigation bar, not lootable");
-        int bar = page.getSize() - 9;
-        for (int i = bar; i < page.getSize(); i++) {
-            page.setItem(i, filler);
+        ItemStack[] bar = navigationBar(index, total);
+        int start = page.getSize() - 9;
+        for (int i = 0; i < 9; i++) {
+            page.setItem(start + i, bar[i]);
         }
+    }
+
+    /** The nine panes of a page's navigation bar, left to right. */
+    private static ItemStack[] navigationBar(int index, int total) {
+        ItemStack[] bar = new ItemStack[9];
+        ItemStack filler = glassPane("BLACK", 15, ChatColor.GRAY + "Page " + (index + 1) + "/" + total,
+                ChatColor.DARK_GRAY + "Navigation bar, not lootable");
+        Arrays.fill(bar, filler);
         if (index > 0) {
-            page.setItem(bar, glassPane("RED", 14, ChatColor.RED + "\u00AB Previous page",
-                    ChatColor.GRAY + "Go to page " + index + "/" + total));
+            bar[0] = glassPane("RED", 14, ChatColor.RED + "\u00AB Previous page",
+                    ChatColor.GRAY + "Go to page " + index + "/" + total);
         }
         if (index < total - 1) {
-            page.setItem(bar + 8, glassPane("GREEN", 13, ChatColor.GREEN + "Next page \u00BB",
-                    ChatColor.GRAY + "Go to page " + (index + 2) + "/" + total));
+            bar[8] = glassPane("GREEN", 13, ChatColor.GREEN + "Next page \u00BB",
+                    ChatColor.GRAY + "Go to page " + (index + 2) + "/" + total);
+        }
+        return bar;
+    }
+
+    static boolean isNav(ItemStack stack) {
+        if (stack == null || stack.getAmount() <= 0 || !stack.hasItemMeta()) {
+            return false;
+        }
+        ItemMeta meta = stack.getItemMeta();
+        if (meta == null || !meta.hasLore()) {
+            return false;
+        }
+        List<String> lore = meta.getLore();
+        for (String line : lore) {
+            if (line.endsWith(NAV_TAG)) {
+                return true;
+            }
+        }
+        // Untagged panes handed out by 0.2.0, recognised by their exact colored lore.
+        return lore.size() == 1 && (lore.get(0).equals(ChatColor.DARK_GRAY + "Navigation bar, not lootable")
+                || lore.get(0).matches(Pattern.quote(ChatColor.GRAY + "Go to page ") + "\\d+/\\d+"));
+    }
+
+    /** Repairs every storage page someone has open, and takes back any pane that ended up with a player. */
+    private void guardOpenPages() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            Inventory top = player.getOpenInventory().getTopInventory();
+            PageHolder page = pageOf(top);
+            if (page == null) {
+                continue;
+            }
+            if (page.index < pages.size() && pages.get(page.index) == top) {
+                repairPage(top, page.index, pages.size());
+            }
+            purgePanes(player);
+        }
+    }
+
+    /**
+     * Puts the navigation bar back in place. Panes found among the items are removed. Stored items
+     * found in the bar are moved back into the item area, or kept aside if the page is full. Nothing is deleted.
+     */
+    private void repairPage(Inventory page, int index, int total) {
+        int itemSlots = page.getSize() - 9;
+        for (int i = 0; i < itemSlots; i++) {
+            if (isNav(page.getItem(i))) {
+                page.setItem(i, null);
+            }
+        }
+        ItemStack[] bar = navigationBar(index, total);
+        for (int i = 0; i < 9; i++) {
+            ItemStack current = page.getItem(itemSlots + i);
+            if (current != null && current.getAmount() == 1 && current.isSimilar(bar[i])) {
+                continue;
+            }
+            if (!isEmpty(current) && !isNav(current)) {
+                int free = -1;
+                for (int j = 0; j < itemSlots && free < 0; j++) {
+                    if (isEmpty(page.getItem(j))) {
+                        free = j;
+                    }
+                }
+                if (free >= 0) {
+                    page.setItem(free, current);
+                } else {
+                    displaced.add(current.clone());
+                }
+            }
+            page.setItem(itemSlots + i, bar[i]);
+        }
+    }
+
+    /** Removes navigation panes from a player's inventory and cursor. */
+    private static void purgePanes(HumanEntity player) {
+        if (isNav(player.getItemOnCursor())) {
+            player.setItemOnCursor(null);
+        }
+        PlayerInventory inventory = player.getInventory();
+        ItemStack[] contents = inventory.getContents();
+        for (int i = 0; i < contents.length; i++) {
+            if (isNav(contents[i])) {
+                inventory.setItem(i, null);
+            }
+        }
+    }
+
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        purgePanes(e.getPlayer());
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onDrop(PlayerDropItemEvent e) {
+        if (isNav(e.getItemDrop().getItemStack())) {
+            e.getItemDrop().remove();
         }
     }
 
@@ -511,7 +632,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         ItemStack pane = new ItemStack(type, 1, data);
         ItemMeta meta = pane.getItemMeta();
         meta.setDisplayName(name);
-        meta.setLore(Collections.singletonList(lore));
+        meta.setLore(Collections.singletonList(lore + NAV_TAG));
         pane.setItemMeta(meta);
         return pane;
     }
@@ -565,6 +686,14 @@ public class Unlooted extends JavaPlugin implements Listener {
     /** Once nobody looks at the shared inventory any more, shrink it to what is left. */
     @EventHandler
     public void onClose(InventoryCloseEvent e) {
+        if (pageOf(e.getInventory()) != null) {
+            // The cursor item goes back to the player after this event, so check again next tick.
+            final HumanEntity player = e.getPlayer();
+            purgePanes(player);
+            if (isEnabled()) {
+                getServer().getScheduler().runTask(this, () -> purgePanes(player));
+            }
+        }
         if (rebuilding || !isEnabled() || pageOf(e.getInventory()) == null || compactQueued) {
             return;
         }

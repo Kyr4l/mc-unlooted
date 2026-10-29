@@ -8,7 +8,7 @@ Bukkit plugin for Minecraft 1.12.1 that collects items left lying on the ground 
 - **Global loot timer.** A sweep runs every `loot-interval-seconds`. It loots every item whose own timer reached `loot-delay-seconds`, all in the same sweep. Items are never looted the instant their own timer ends.
 - **Any item type.** The sweep scans every loaded item entity, so modded items are collected even when a mod spawns them without firing a Bukkit event. Items that can never be picked up, such as shop display items, are skipped by default.
 - **Unlimited, self-resizing shared inventory.** Each page holds up to 45 stacks and is only as tall as its items need. More items simply add more pages. The inventory shrinks again once nobody has it open.
-- **Navigation bar.** The bottom row of every page is a bar of black glass panes that can't be taken. A red pane goes to the previous page and a green pane to the next one. They only appear when there is a page to go to.
+- **Navigation bar.** The bottom row of every page is a bar of black glass panes that can't be taken. A red pane goes to the previous page and a green pane to the next one. They only appear when there is a page to go to. Open pages are checked every tick, so sorting mods can't move the panes or push stored items into the bar, and a pane that escapes is removed.
 - **Broadcast.** After a sweep that looted something, the plugin announces how many items were collected. Nothing is sent when a sweep looted nothing.
 - Vanilla's 5 minute despawn is cancelled for tracked items, so they wait for the plugin instead of vanishing.
 
