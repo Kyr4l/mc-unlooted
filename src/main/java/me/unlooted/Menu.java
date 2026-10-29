@@ -21,10 +21,9 @@ import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.PlayerInventory;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -46,8 +45,6 @@ final class Menu implements Listener {
     private static final int SCAN_LIMIT = 256;
 
     private enum Nav { PREV, NEXT, BACK, SORT, SEARCH }
-
-    enum Sort { RECENT, NAME, AMOUNT }
 
     /** One stack shown in a stack list. */
     private static final class StackRef {
@@ -89,15 +86,21 @@ final class Menu implements Listener {
     private final Storage storage;
     private final Map<UUID, Long> lastClick = new HashMap<UUID, Long>();
     private final Set<UUID> resyncing = new HashSet<UUID>();
-    private final Map<UUID, Sort> sorts = new HashMap<UUID, Sort>();
+    private final Map<UUID, SortedGroups.Mode> sorts = new HashMap<UUID, SortedGroups.Mode>();
     private final Map<UUID, String> searches = new HashMap<UUID, String>();
-    private final Map<Sort, List<Storage.Group>> sortedCache = new HashMap<Sort, List<Storage.Group>>();
-    private long sortedVersion = -1;
+    private final SortedGroups sorted;
     private int tick;
 
     Menu(Unlooted plugin, Storage storage) {
         this.plugin = plugin;
         this.storage = storage;
+        this.sorted = new SortedGroups(storage);
+        storage.setListener(sorted);
+    }
+
+    private SortedGroups.Mode sortOf(UUID player) {
+        SortedGroups.Mode mode = sorts.get(player);
+        return mode == null ? SortedGroups.Mode.RECENT : mode;
     }
 
     private Messages msg() {
@@ -121,37 +124,13 @@ final class Menu implements Listener {
 
     /** The item list for a player: sorted by their sort mode and filtered by their search. */
     List<Storage.Group> listFor(UUID player) {
-        Sort sort = sorts.containsKey(player) ? sorts.get(player) : Sort.RECENT;
-        if (sortedVersion != storage.version()) {
-            sortedCache.clear();
-            sortedVersion = storage.version();
-        }
-        List<Storage.Group> sorted = sortedCache.get(sort);
-        if (sorted == null) {
-            sorted = new ArrayList<Storage.Group>(storage.groups());
-            if (sort == Sort.RECENT) {
-                final Map<Storage.Group, Long> last = new HashMap<Storage.Group, Long>();
-                for (Storage.Group g : sorted) {
-                    last.put(g, g.lastLooted());
-                }
-                Collections.sort(sorted, (a, b) -> Long.compare(last.get(b), last.get(a)));
-            } else if (sort == Sort.NAME) {
-                Collections.sort(sorted, Comparator.comparing(g -> g.searchText));
-            } else {
-                final Map<Storage.Group, Long> totals = new HashMap<Storage.Group, Long>();
-                for (Storage.Group g : sorted) {
-                    totals.put(g, g.total());
-                }
-                Collections.sort(sorted, (a, b) -> Long.compare(totals.get(b), totals.get(a)));
-            }
-            sortedCache.put(sort, sorted);
-        }
+        List<Storage.Group> list = sorted.get(sortOf(player));
         String query = searches.get(player);
         if (query == null) {
-            return sorted;
+            return list;
         }
         List<Storage.Group> filtered = new ArrayList<Storage.Group>();
-        for (Storage.Group g : sorted) {
+        for (Storage.Group g : list) {
             if (g.searchText.contains(query)) {
                 filtered.add(g);
             }
@@ -340,8 +319,7 @@ final class Menu implements Listener {
             bar[2] = query == null
                     ? Tags.pane("LIGHT_BLUE", 3, m.get("search"), m.get("search-lore"))
                     : Tags.pane("LIGHT_BLUE", 3, m.get("search-active", "query", query), m.get("search-active-lore"));
-            Sort sort = sorts.containsKey(viewer) ? sorts.get(viewer) : Sort.RECENT;
-            bar[6] = Tags.pane("CYAN", 9, m.get("sort", "mode", m.get("sort-" + sort.name().toLowerCase(Locale.ROOT))), m.get("sort-lore"));
+            bar[6] = Tags.pane("CYAN", 9, m.get("sort", "mode", m.get("sort-" + sortOf(viewer).name().toLowerCase(Locale.ROOT))), m.get("sort-lore"));
         }
         return bar;
     }
@@ -461,8 +439,8 @@ final class Menu implements Listener {
             searches.remove(id);
             open(player, null, 0, 0);
         } else if (action == Nav.SORT) {
-            Sort current = sorts.containsKey(id) ? sorts.get(id) : Sort.RECENT;
-            sorts.put(id, Sort.values()[(current.ordinal() + 1) % Sort.values().length]);
+            SortedGroups.Mode[] modes = SortedGroups.Mode.values();
+            sorts.put(id, modes[(sortOf(id).ordinal() + 1) % modes.length]);
             open(player, null, 0, 0);
         } else if (action instanceof Storage.Group) {
             Storage.Group group = (Storage.Group) action;
@@ -496,7 +474,9 @@ final class Menu implements Listener {
                 player.sendMessage(msg().get("reserved-stack"));
             } else {
                 long amount = click == ClickType.RIGHT ? half(ref.amount) : ref.amount;
-                long[] result = giveFromLot(player, group, ref.lot, Math.min(amount, ref.lot.amount));
+                Map<String, Long> sources = new LinkedHashMap<String, Long>();
+                long[] result = giveFromLot(player, group, ref.lot, Math.min(amount, ref.lot.amount), sources);
+                logTake(player, group, result[0], sources);
                 finishTake(player, group, result[0], result[1] > 0);
             }
         }
@@ -518,6 +498,7 @@ final class Menu implements Listener {
         long taken = 0;
         boolean full = false;
         boolean any = false;
+        Map<String, Long> sources = new LinkedHashMap<String, Long>();
         for (Storage.Lot lot : storage.ordered(group, player.getUniqueId(), now)) {
             if (remaining <= 0 || full) {
                 break;
@@ -527,7 +508,7 @@ final class Menu implements Listener {
             }
             any = true;
             while (remaining > 0 && lot.amount > 0 && !full) {
-                long[] result = giveFromLot(player, group, lot, Math.min(Math.min(remaining, lot.amount), group.maxStack));
+                long[] result = giveFromLot(player, group, lot, Math.min(Math.min(remaining, lot.amount), group.maxStack), sources);
                 taken += result[0];
                 remaining -= result[0];
                 full = result[1] > 0 || result[0] == 0;
@@ -536,14 +517,15 @@ final class Menu implements Listener {
         if (!any) {
             player.sendMessage(msg().get("reserved-items"));
         }
+        logTake(player, group, taken, sources);
         finishTake(player, group, taken, full);
     }
 
     /**
-     * Moves up to one stack from a lot into the player's inventory, logging it. Whatever doesn't fit stays
-     * in storage. Returns {taken, leftover}.
+     * Moves up to one stack from a lot into the player's inventory. Whatever doesn't fit stays in storage.
+     * Adds the amount to sources under the lot's kind (shared, own, or whose reservation). Returns {taken, leftover}.
      */
-    private long[] giveFromLot(Player player, Storage.Group group, Storage.Lot lot, long amount) {
+    private long[] giveFromLot(Player player, Storage.Group group, Storage.Lot lot, long amount, Map<String, Long> sources) {
         ItemStack item = group.template.clone();
         item.setAmount((int) Math.max(1, Math.min(amount, group.maxStack)));
         int wanted = item.getAmount();
@@ -553,12 +535,30 @@ final class Menu implements Listener {
         }
         long taken = wanted - leftover;
         if (taken > 0) {
-            String from = lot.owner == null ? "" : lot.owner.equals(player.getUniqueId()) ? " (own)" : " (reserved for " + lot.ownerName + ")";
+            String from = lot.owner == null ? "shared" : lot.owner.equals(player.getUniqueId()) ? "own" : "reserved for " + lot.ownerName;
+            Long before = sources.get(from);
+            sources.put(from, (before == null ? 0 : before) + taken);
             storage.take(group, lot, taken);
             plugin.markDirty();
-            plugin.log(player.getName() + " took " + taken + " " + Tags.displayName(group.template, "unknown item") + from);
         }
         return new long[] {taken, leftover};
+    }
+
+    /** One log line per action, however many stacks it moved. */
+    private void logTake(Player player, Storage.Group group, long taken, Map<String, Long> sources) {
+        if (taken <= 0) {
+            return;
+        }
+        StringBuilder line = new StringBuilder(player.getName()).append(" took ").append(taken).append(' ')
+                .append(Tags.displayName(group.template, "unknown item"));
+        if (!(sources.size() == 1 && sources.containsKey("shared"))) {
+            List<String> parts = new ArrayList<String>();
+            for (Map.Entry<String, Long> entry : sources.entrySet()) {
+                parts.add(entry.getValue() + " " + entry.getKey());
+            }
+            line.append(" (").append(String.join(", ", parts)).append(')');
+        }
+        plugin.log(line.toString());
     }
 
     private void finishTake(Player player, Storage.Group group, long taken, boolean full) {

@@ -13,10 +13,12 @@ import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
 import org.bukkit.entity.Projectile;
 import org.bukkit.entity.Player;
+import org.bukkit.event.Event;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemDespawnEvent;
 import org.bukkit.event.entity.ItemMergeEvent;
@@ -35,6 +37,7 @@ import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -142,8 +145,16 @@ public class Unlooted extends JavaPlugin implements Listener {
     }
 
     private final Map<UUID, Timer> timers = new HashMap<UUID, Timer>();
+    /**
+     * Who dropped each item entity. Kept apart from the timers, which can be forgotten and restarted:
+     * an owner is only forgotten once the item is known to be gone, or after it went unseen for a week.
+     */
     private final Map<UUID, Owner> owners = new HashMap<UUID, Owner>();
-    private PendingDeath pendingDeath;
+    private final Map<UUID, Long> ownerSeen = new HashMap<UUID, Long>();
+    /** Deaths of this tick whose drops are about to spawn. Several players can die in the same tick. */
+    private final List<PendingDeath> pendingDeaths = new ArrayList<PendingDeath>();
+    /** Items that may have been destroyed this tick, checked together on the next one. */
+    private final Set<Item> goneChecks = new HashSet<Item>();
 
     private ItemCodec codec;
     private Storage storage;
@@ -201,6 +212,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(menu, this);
+        registerEntityEvents();
 
         applyConfig();
         checkTagging();
@@ -352,18 +364,51 @@ public class Unlooted extends JavaPlugin implements Listener {
             return;
         }
         timers.put(item.getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
-        PendingDeath death = pendingDeath;
-        if (death != null && death.location.getWorld().equals(item.getWorld())
-                && death.location.distanceSquared(item.getLocation()) < 9) {
+        for (PendingDeath death : pendingDeaths) {
+            if (!death.location.getWorld().equals(item.getWorld()) || death.location.distanceSquared(item.getLocation()) >= 9) {
+                continue;
+            }
             for (Iterator<ItemStack> it = death.drops.iterator(); it.hasNext(); ) {
                 ItemStack drop = it.next();
                 if (drop.getAmount() == stack.getAmount() && drop.isSimilar(stack)) {
-                    owners.put(item.getUniqueId(), death.owner);
+                    setOwner(item.getUniqueId(), death.owner);
                     it.remove();
-                    break;
+                    return;
                 }
             }
         }
+    }
+
+    private void setOwner(UUID item, Owner owner) {
+        owners.put(item, owner);
+        ownerSeen.put(item, System.currentTimeMillis());
+    }
+
+    private void forgetOwner(UUID item) {
+        owners.remove(item);
+        ownerSeen.remove(item);
+    }
+
+    /**
+     * Forgets an item once it is really gone, checked a tick after something may have destroyed it.
+     * Hoppers retry pickups constantly, so all checks of a tick share one task.
+     */
+    private void forgetIfGone(Item item) {
+        if (!isEnabled()) {
+            return;
+        }
+        if (goneChecks.isEmpty()) {
+            getServer().getScheduler().runTask(this, () -> {
+                for (Item checked : goneChecks) {
+                    if (checked.isDead()) {
+                        timers.remove(checked.getUniqueId());
+                        forgetOwner(checked.getUniqueId());
+                    }
+                }
+                goneChecks.clear();
+            });
+        }
+        goneChecks.add(item);
     }
 
     @EventHandler(priority = EventPriority.LOWEST)
@@ -375,7 +420,10 @@ public class Unlooted extends JavaPlugin implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onDrop(PlayerDropItemEvent e) {
-        owners.put(e.getItemDrop().getUniqueId(), new Owner(e.getPlayer().getUniqueId(), e.getPlayer().getName()));
+        if (e.getItemDrop().isDead()) {
+            return;
+        }
+        setOwner(e.getItemDrop().getUniqueId(), new Owner(e.getPlayer().getUniqueId(), e.getPlayer().getName()));
     }
 
     /** Death drops spawn right after this event, in the same tick: remember them to tag their owner. */
@@ -391,19 +439,31 @@ public class Unlooted extends JavaPlugin implements Listener {
             }
         }
         Player player = e.getEntity();
-        pendingDeath = new PendingDeath(new Owner(player.getUniqueId(), player.getName()), player.getLocation(), drops);
-        getServer().getScheduler().runTask(this, () -> pendingDeath = null);
+        if (pendingDeaths.isEmpty()) {
+            getServer().getScheduler().runTask(this, pendingDeaths::clear);
+        }
+        pendingDeaths.add(new PendingDeath(new Owner(player.getUniqueId(), player.getName()), player.getLocation(), drops));
     }
 
     /** A pickup (even a partial one) counts as interaction: restart the item's timer. */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onEntityPickup(EntityPickupItemEvent e) {
         restart(e.getItem());
+        forgetIfGone(e.getItem());
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onHopperPickup(InventoryPickupItemEvent e) {
         restart(e.getItem());
+        forgetIfGone(e.getItem());
+    }
+
+    /** Items burn in fire and lava, and break in explosions or on cactus. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onItemDamage(EntityDamageEvent e) {
+        if (e.getEntity() instanceof Item) {
+            forgetIfGone((Item) e.getEntity());
+        }
     }
 
     private void restart(Item item) {
@@ -423,7 +483,7 @@ public class Unlooted extends JavaPlugin implements Listener {
     public void onMerge(ItemMergeEvent e) {
         long now = System.currentTimeMillis();
         Timer source = timers.remove(e.getEntity().getUniqueId());
-        owners.remove(e.getEntity().getUniqueId());
+        forgetOwner(e.getEntity().getUniqueId());
         Timer target = timers.get(e.getTarget().getUniqueId());
         long age = Math.min(source == null ? 0 : source.current(now), target == null ? 0 : target.current(now));
         timers.put(e.getTarget().getUniqueId(), new Timer(age, now, false));
@@ -447,13 +507,61 @@ public class Unlooted extends JavaPlugin implements Listener {
         long now = System.currentTimeMillis();
         for (Entity entity : e.getChunk().getEntities()) {
             if (entity instanceof Item) {
-                Timer t = timers.get(entity.getUniqueId());
-                if (t != null && !t.paused) {
-                    t.advance(now);
-                    t.paused = true;
-                }
+                pause(entity.getUniqueId(), now);
             }
         }
+    }
+
+    /** Stops the timer of an item whose chunk or entity section is unloading. */
+    private void pause(UUID id, long now) {
+        Timer t = timers.get(id);
+        if (t != null && !t.paused) {
+            t.advance(now);
+            t.paused = true;
+        }
+    }
+
+    /**
+     * Since 1.17 entities load and unload apart from their chunk, through their own events. Those don't
+     * exist in the 1.12 API this plugin compiles against, so they are found and registered by reflection.
+     */
+    private void registerEntityEvents() {
+        registerEntitiesEvent("org.bukkit.event.world.EntitiesUnloadEvent", true);
+        registerEntitiesEvent("org.bukkit.event.world.EntitiesLoadEvent", false);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void registerEntitiesEvent(String className, final boolean unload) {
+        final Class<? extends Event> type;
+        final Method getEntities;
+        try {
+            type = (Class<? extends Event>) Class.forName(className);
+            getEntities = type.getMethod("getEntities");
+        } catch (Throwable t) {
+            return;
+        }
+        getServer().getPluginManager().registerEvent(type, this, EventPriority.MONITOR, (listener, event) -> {
+            if (!type.isInstance(event)) {
+                return;
+            }
+            List<?> entities;
+            try {
+                entities = (List<?>) getEntities.invoke(event);
+            } catch (Exception ex) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            for (Object entity : entities) {
+                if (entity instanceof Item) {
+                    UUID id = ((Item) entity).getUniqueId();
+                    if (unload) {
+                        pause(id, now);
+                    } else {
+                        resume(id, now);
+                    }
+                }
+            }
+        }, this, true);
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
@@ -519,7 +627,19 @@ public class Unlooted extends JavaPlugin implements Listener {
                 it.remove();
             }
         }
-        owners.keySet().retainAll(timers.keySet());
+        for (UUID id : seen) {
+            if (owners.containsKey(id)) {
+                ownerSeen.put(id, now);
+            }
+        }
+        for (Iterator<Map.Entry<UUID, Owner>> it = owners.entrySet().iterator(); it.hasNext(); ) {
+            UUID id = it.next().getKey();
+            Long last = ownerSeen.get(id);
+            if (!timers.containsKey(id) && (last == null || now - last > FORGET_UNLOADED_MS)) {
+                it.remove();
+                ownerSeen.remove(id);
+            }
+        }
 
         return due.isEmpty() ? 0 : loot(due, now);
     }
@@ -533,7 +653,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             UUID id = item.getUniqueId();
             if (stack == null || stack.getAmount() <= 0 || Tags.isTagged(stack)) {
                 timers.remove(id);
-                owners.remove(id);
+                forgetOwner(id);
                 item.remove();
                 continue;
             }
@@ -550,7 +670,7 @@ public class Unlooted extends JavaPlugin implements Listener {
                     reservedPerOwner.put(owner.id, (before == null ? 0 : before) + stack.getAmount());
                 }
                 timers.remove(id);
-                owners.remove(id);
+                forgetOwner(id);
                 item.remove();
             }
             // Otherwise max-pages is reached and the item needs a new entry: it stays on the ground.
@@ -990,16 +1110,19 @@ public class Unlooted extends JavaPlugin implements Listener {
         long now = System.currentTimeMillis();
         Map<String, Object> timerData = new LinkedHashMap<String, Object>();
         for (Map.Entry<UUID, Timer> entry : timers.entrySet()) {
-            Map<String, Object> t = new LinkedHashMap<String, Object>();
-            t.put("age", entry.getValue().current(now));
-            Owner owner = owners.get(entry.getKey());
-            if (owner != null) {
-                t.put("owner", owner.id.toString());
-                t.put("owner-name", owner.name);
-            }
-            timerData.put(entry.getKey().toString(), t);
+            timerData.put(entry.getKey().toString(), entry.getValue().current(now));
         }
         root.put("timers", timerData);
+        Map<String, Object> ownerData = new LinkedHashMap<String, Object>();
+        for (Map.Entry<UUID, Owner> entry : owners.entrySet()) {
+            Map<String, Object> o = new LinkedHashMap<String, Object>();
+            o.put("owner", entry.getValue().id.toString());
+            o.put("owner-name", entry.getValue().name);
+            Long seenAt = ownerSeen.get(entry.getKey());
+            o.put("seen", seenAt == null ? now : seenAt);
+            ownerData.put(entry.getKey().toString(), o);
+        }
+        root.put("owners", ownerData);
         dirty = false;
         final long seq = ++saveSeq;
         if (sync || !codec.isLossless()) {
@@ -1036,6 +1159,18 @@ public class Unlooted extends JavaPlugin implements Listener {
             } catch (IOException ex) {
                 getLogger().log(Level.SEVERE, "Could not save data.yml", ex);
             }
+        }
+    }
+
+    private void loadOwner(UUID item, String owner, String name, long seen) {
+        if (owner == null) {
+            return;
+        }
+        try {
+            owners.put(item, new Owner(UUID.fromString(owner), name));
+            ownerSeen.put(item, seen);
+        } catch (IllegalArgumentException ignored) {
+            // Unknown owner: the item becomes shared.
         }
     }
 
@@ -1079,19 +1214,27 @@ public class Unlooted extends JavaPlugin implements Listener {
                 if (section.isConfigurationSection(key)) {
                     ConfigurationSection t = section.getConfigurationSection(key);
                     age = t.getLong("age");
-                    String owner = t.getString("owner");
-                    if (owner != null) {
-                        try {
-                            owners.put(id, new Owner(UUID.fromString(owner), t.getString("owner-name", "its owner")));
-                        } catch (IllegalArgumentException ignored) {
-                            // Unknown owner: the item becomes shared.
-                        }
-                    }
+                    // Saved by 0.3.0 to 0.5.1, which kept the owner with the timer.
+                    loadOwner(id, t.getString("owner"), t.getString("owner-name", "its owner"), now);
                 } else {
                     age = section.getLong(key);
                 }
                 // Paused until the item is seen in a loaded chunk again.
                 timers.put(id, new Timer(age, now, true));
+            }
+        }
+        ConfigurationSection ownerSection = yml.getConfigurationSection("owners");
+        if (ownerSection != null) {
+            for (String key : ownerSection.getKeys(false)) {
+                ConfigurationSection o = ownerSection.getConfigurationSection(key);
+                if (o == null) {
+                    continue;
+                }
+                try {
+                    loadOwner(UUID.fromString(key), o.getString("owner"), o.getString("owner-name", "its owner"), o.getLong("seen", now));
+                } catch (IllegalArgumentException ignored) {
+                    // Corrupt key: skip it.
+                }
             }
         }
         if (yml.contains("items")) {

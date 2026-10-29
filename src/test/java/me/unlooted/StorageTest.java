@@ -240,6 +240,58 @@ public class StorageTest {
         assertEquals(5 + 20, hidden.totalItems());
     }
 
+    private static long bruteReserved(Storage storage, UUID owner, long now) {
+        long total = 0;
+        for (Storage.Group group : storage.groups()) {
+            for (Storage.Lot lot : group.lots) {
+                if (lot.reserved(now) && lot.owner.equals(owner)) {
+                    total += lot.amount;
+                }
+            }
+        }
+        return total;
+    }
+
+    /** Random loots, takes, expiries and reservation expiries: incremental views must match a full recount. */
+    @Test
+    public void incrementalSortingAndOwnerCountsMatchFullRecount() {
+        java.util.Random random = new java.util.Random(42);
+        SortedGroups sorted = new SortedGroups(storage);
+        storage.setListener(sorted);
+        Material[] types = {Material.STONE, Material.DIRT, Material.COBBLESTONE, Material.SAND, Material.GRAVEL, Material.ARROW};
+        UUID[] owners = {null, ALICE, BOB};
+        long now = NOW;
+        for (int step = 0; step < 3000; step++) {
+            now += random.nextInt(2000);
+            // Touch every list so they are all kept incrementally from here on.
+            for (SortedGroups.Mode mode : SortedGroups.Mode.values()) {
+                sorted.get(mode);
+            }
+            int op = random.nextInt(10);
+            if (op < 6 || storage.isEmpty()) {
+                UUID owner = owners[random.nextInt(owners.length)];
+                storage.add(new ItemStack(types[random.nextInt(types.length)], 1 + random.nextInt(64), (short) random.nextInt(3)),
+                        owner, owner == null ? null : "x", owner == null ? 0 : now + random.nextInt(30_000),
+                        Integer.MAX_VALUE, now, at(now));
+            } else if (op < 9) {
+                Storage.Group group = storage.groups().get(random.nextInt(storage.groups().size()));
+                storage.normalize(group, now);
+                Storage.Lot lot = group.lots.get(random.nextInt(group.lots.size()));
+                storage.take(group, lot, 1 + random.nextInt(80));
+            } else {
+                storage.expire(now - 20_000);
+            }
+            for (SortedGroups.Mode mode : SortedGroups.Mode.values()) {
+                List<Storage.Group> expected = new ArrayList<Storage.Group>(storage.groups());
+                java.util.Collections.sort(expected, SortedGroups.comparator(mode));
+                assertEquals("step " + step + " " + mode, expected, sorted.get(mode));
+            }
+            for (UUID owner : new UUID[] {ALICE, BOB}) {
+                assertEquals("step " + step, bruteReserved(storage, owner, now), storage.reservedFor(owner, now));
+            }
+        }
+    }
+
     @Test
     public void messagesFillPlaceholdersAndColors() {
         Messages messages = new Messages();
