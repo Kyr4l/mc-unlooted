@@ -7,7 +7,8 @@ loot-delay-seconds: 300
 # Each sweep loots every item whose own timer reached loot-delay-seconds, all at once.
 loot-interval-seconds: 60
 
-# The shared inventory resizes itself to fit the looted stacks, in pages of up to 54 slots.
+# The shared inventory resizes itself to fit the looted stacks, in pages of up to 45 items
+# with a navigation bar at the bottom. Storage is unlimited by default.
 # Maximum number of pages. 0 = unlimited. When the cap is hit, items stay on the ground.
 max-pages: 0
 
