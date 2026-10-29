@@ -7,10 +7,21 @@ loot-delay-seconds: 300
 # Each sweep loots every item whose own timer reached loot-delay-seconds, all at once.
 loot-interval-seconds: 60
 
-# The shared inventory resizes itself to fit the looted stacks, in pages of up to 45 items
-# with a navigation bar at the bottom. Storage is unlimited by default.
-# Maximum number of pages. 0 = unlimited. When the cap is hit, items stay on the ground.
+# Items a player dropped, or lost on death, are reserved for that player for this many
+# seconds after they are looted. Only they (and admins) can take them meanwhile. 0 = off.
+owner-priority-seconds: 600
+
+# The storage shows one entry per distinct item, 45 entries per page. Storage is unlimited by default.
+# Maximum number of pages. 0 = unlimited. When the cap is hit, items that would need a new
+# entry stay on the ground. More of an item already in storage always fits.
 max-pages: 0
+
+# Worlds where dropped items are never looted, for example a creative world.
+excluded-worlds: []
+
+# Item types that are never looted, such as junk. Use Bukkit material names, like DIRT
+# or DIAMOND_SWORD. * matches anything, so *_SAPLING matches every sapling.
+excluded-items: []
 
 # Skip items that can never be picked up, such as shop plugin display items.
 ignore-unpickupable-items: true

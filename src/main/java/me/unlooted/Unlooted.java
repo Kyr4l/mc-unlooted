@@ -2,7 +2,7 @@ package me.unlooted;
 
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
-import org.bukkit.Material;
+import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -10,7 +10,6 @@ import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Entity;
-import org.bukkit.entity.HumanEntity;
 import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -20,86 +19,50 @@ import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemDespawnEvent;
 import org.bukkit.event.entity.ItemMergeEvent;
 import org.bukkit.event.entity.ItemSpawnEvent;
-import org.bukkit.event.inventory.InventoryClickEvent;
-import org.bukkit.event.inventory.InventoryCloseEvent;
-import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryPickupItemEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
-import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
-import org.bukkit.inventory.Inventory;
-import org.bukkit.inventory.PlayerInventory;
-import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.StandardCopyOption;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.LinkedHashMap;
-import java.util.regex.Pattern;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.IdentityHashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.logging.Level;
+import java.util.regex.Pattern;
 
 /**
  * Auto-loots dropped items that nobody touched for a while.
  *
- * Every dropped item has its own timer that only runs while its chunk is loaded.
- * A separate global sweep runs on a fixed interval and loots, in one go, every item
- * whose own timer has reached the loot delay. The shared inventory grows and shrinks
- * with the number of stored stacks, split into pages of at most 54 slots.
+ * Every dropped item has its own timer that only runs while its chunk is loaded. A separate global
+ * sweep runs on a fixed interval and loots, in one go, every item whose own timer reached the delay.
+ * Looted items go into a shared, unlimited storage that players browse through a take-only menu.
  */
 public class Unlooted extends JavaPlugin implements Listener {
 
-    /**
-     * Invisible tag at the end of every navigation pane's lore. Players can't type section signs,
-     * so no real item carries it. Anything tagged is a pane and gets removed wherever it escapes to.
-     */
-    private static final String NAV_TAG = "" + ChatColor.RESET + ChatColor.BLACK + ChatColor.DARK_BLUE
-            + ChatColor.DARK_GREEN + ChatColor.DARK_AQUA + ChatColor.RESET;
-
-    /** Items per page: five rows. The sixth row is the navigation bar. */
-    private static final int PAGE_SLOTS = 45;
-
-    /** Marks an inventory as one page of the shared storage and remembers which one. */
-    private static final class PageHolder implements InventoryHolder {
-        final int index;
-        Inventory inventory;
-
-        PageHolder(int index) {
-            this.index = index;
-        }
-
-        @Override
-        public Inventory getInventory() {
-            return inventory;
-        }
-
-        /** Slots above the navigation bar. */
-        int itemSlots() {
-            return inventory.getSize() - 9;
-        }
-    }
     /** Vanilla uses 32767 as "can never be picked up" (shop displays, decorations...). */
     private static final int INFINITE_PICKUP_DELAY = 32767;
     /** Forget timers of items that stayed in unloaded chunks for this long. */
     private static final long FORGET_UNLOADED_MS = 7L * 24 * 60 * 60 * 1000;
+    private static final long CLEAR_CONFIRM_MS = 30_000L;
 
     /** Per-item timer. Age only grows while the item's chunk is loaded. */
     private static final class Timer {
@@ -123,8 +86,39 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
     }
 
-    private final Map<UUID, Timer> timers = new HashMap<UUID, Timer>();
-    private final List<Inventory> pages = new ArrayList<Inventory>();
+    /** Who dropped an item entity. */
+    private static final class Owner {
+        final UUID id;
+        final String name;
+
+        Owner(UUID id, String name) {
+            this.id = id;
+            this.name = name;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof Owner && ((Owner) o).id.equals(id);
+        }
+
+        @Override
+        public int hashCode() {
+            return id.hashCode();
+        }
+    }
+
+    /** A death whose drops are about to spawn this tick, so they can be matched to their owner. */
+    private static final class PendingDeath {
+        final Owner owner;
+        final Location location;
+        final List<ItemStack> drops;
+
+        PendingDeath(Owner owner, Location location, List<ItemStack> drops) {
+            this.owner = owner;
+            this.location = location;
+            this.drops = drops;
+        }
+    }
 
     /** Config keys that can be changed with /unlooted config, and the kind of value each one takes. */
     private static final Map<String, String> SETTINGS = new LinkedHashMap<String, String>();
@@ -132,30 +126,41 @@ public class Unlooted extends JavaPlugin implements Listener {
     static {
         SETTINGS.put("loot-delay-seconds", "seconds, at least 1");
         SETTINGS.put("loot-interval-seconds", "seconds, at least 1");
+        SETTINGS.put("owner-priority-seconds", "seconds, 0 to turn off");
         SETTINGS.put("max-pages", "whole number, 0 for unlimited");
+        SETTINGS.put("excluded-worlds", "comma-separated world names, or none");
+        SETTINGS.put("excluded-items", "comma-separated item names, * as wildcard, or none");
         SETTINGS.put("ignore-unpickupable-items", "true or false");
         SETTINGS.put("broadcast-message", "text, & color codes, {count} and {stacks}");
     }
 
+    private final Map<UUID, Timer> timers = new HashMap<UUID, Timer>();
+    private final Map<UUID, Owner> owners = new HashMap<UUID, Owner>();
+    private PendingDeath pendingDeath;
+
+    private ItemCodec codec;
+    private Storage storage;
+    private Menu menu;
+
     private long delayMs;
+    private long priorityMs;
     private long intervalTicks;
     private BukkitTask sweepTask;
-    private int maxSlots;
+    private int maxGroups;
     private boolean ignoreUnpickupable;
+    private Set<String> excludedWorlds = new HashSet<String>();
+    private List<Pattern> excludedItems = new ArrayList<Pattern>();
     private String broadcastMessage;
+
     private File dataFile;
-    private ItemCodec codec;
-    /** Stored entries that could not be turned back into items (missing mod...). Kept so they are never lost. */
-    private final List<Object> unreadable = new ArrayList<Object>();
-    private boolean rebuilding;
-    private boolean compactQueued;
-    /** Stored items pushed out of a page by a sorting tool when the page had no free slot. Folded back in on the next rebuild. */
-    private final List<ItemStack> displaced = new ArrayList<ItemStack>();
-    /** Who asked to clear the storage, and when. The clear only happens on a confirm shortly after. */
-    private final Map<String, Long> pendingClears = new HashMap<String, Long>();
-    private static final long CLEAR_CONFIRM_MS = 30_000L;
     /** Set when data.yml exists but cannot be read or moved aside: nothing may be saved over it. */
     private boolean storageBroken;
+    private boolean dirty;
+    private int saveTicks;
+    private long saveSeq;
+    private long writtenSeq;
+    private final Object writeLock = new Object();
+    private final Map<String, Long> pendingClears = new HashMap<String, Long>();
 
     // ------------------------------------------------------------------ lifecycle
 
@@ -164,6 +169,8 @@ public class Unlooted extends JavaPlugin implements Listener {
         saveDefaultConfig();
         dataFile = new File(getDataFolder(), "data.yml");
         codec = new ItemCodec(getLogger());
+        storage = new Storage(codec);
+        menu = new Menu(this, storage);
 
         load();
         if (storageBroken) {
@@ -171,21 +178,39 @@ public class Unlooted extends JavaPlugin implements Listener {
             return;
         }
         getServer().getPluginManager().registerEvents(this, this);
+        getServer().getPluginManager().registerEvents(menu, this);
 
         applyConfig();
-        getServer().getScheduler().runTaskTimer(this, this::save, 20L * 300, 20L * 300);
-        // Sorting mods and other tools can move slots without any click event, so open pages are checked every tick.
-        getServer().getScheduler().runTaskTimer(this, this::guardOpenPages, 1L, 1L);
+        // Saves only when something changed, at most every 30 seconds, plus every 5 minutes for the timers.
+        getServer().getScheduler().runTaskTimer(this, () -> {
+            saveTicks++;
+            if (dirty || saveTicks % 10 == 0) {
+                save(false);
+            }
+        }, 20L * 30, 20L * 30);
+        getServer().getScheduler().runTaskTimer(this, menu::guard, 1L, 1L);
     }
 
     /** Reads config.yml values into fields and (re)starts the global loot timer if its interval changed. */
     private void applyConfig() {
         delayMs = Math.max(1, getConfig().getLong("loot-delay-seconds", 300)) * 1000L;
+        priorityMs = Math.max(0, getConfig().getLong("owner-priority-seconds", 600)) * 1000L;
         int maxPages = Math.max(0, getConfig().getInt("max-pages", 0));
-        maxSlots = maxPages == 0 ? Integer.MAX_VALUE : (int) Math.min(Integer.MAX_VALUE, (long) maxPages * PAGE_SLOTS);
+        maxGroups = maxPages == 0 ? Integer.MAX_VALUE : (int) Math.min(Integer.MAX_VALUE, (long) maxPages * Menu.PER_PAGE);
         ignoreUnpickupable = getConfig().getBoolean("ignore-unpickupable-items", true);
         broadcastMessage = getConfig().getString("broadcast-message",
                 "&e[Unlooted] &f{count} &eitem(s) were auto-looted. Type &f/unlooted &eto claim them.");
+
+        Set<String> worlds = new HashSet<String>();
+        for (String world : getConfig().getStringList("excluded-worlds")) {
+            worlds.add(world.trim().toLowerCase(Locale.ROOT));
+        }
+        excludedWorlds = worlds;
+        List<Pattern> items = new ArrayList<Pattern>();
+        for (String item : getConfig().getStringList("excluded-items")) {
+            items.add(glob(item));
+        }
+        excludedItems = items;
 
         long newInterval = Math.max(1, getConfig().getLong("loot-interval-seconds", 60)) * 20L;
         if (sweepTask == null || newInterval != intervalTicks) {
@@ -197,35 +222,112 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
     }
 
+    /** Item names match Bukkit material names, ignoring case and any "namespace:" prefix. * matches anything. */
+    private static Pattern glob(String name) {
+        String n = name.trim();
+        if (n.indexOf(':') >= 0) {
+            n = n.substring(n.indexOf(':') + 1);
+        }
+        StringBuilder regex = new StringBuilder();
+        for (String part : n.split("\\*", -1)) {
+            if (regex.length() > 0) {
+                regex.append(".*");
+            }
+            regex.append(Pattern.quote(part));
+        }
+        return Pattern.compile(regex.toString(), Pattern.CASE_INSENSITIVE);
+    }
+
     @Override
     public void onDisable() {
-        rebuilding = true;
-        for (Inventory page : pages) {
-            for (HumanEntity viewer : new ArrayList<HumanEntity>(page.getViewers())) {
-                viewer.closeInventory();
-            }
+        if (menu != null) {
+            menu.closeAll();
         }
         long now = System.currentTimeMillis();
         for (Timer t : timers.values()) {
             t.advance(now);
             t.paused = true;
         }
-        save();
+        if (storage != null) {
+            save(true);
+        }
     }
 
-    // ------------------------------------------------------------------ per-item timers
+    void markDirty() {
+        dirty = true;
+    }
 
+    // ------------------------------------------------------------------ per-item timers and owners
+
+    @SuppressWarnings("deprecation")
     private boolean ignored(Item item) {
-        return ignoreUnpickupable && item.getPickupDelay() >= INFINITE_PICKUP_DELAY;
+        if (ignoreUnpickupable && item.getPickupDelay() >= INFINITE_PICKUP_DELAY) {
+            return true;
+        }
+        if (!excludedWorlds.isEmpty() && excludedWorlds.contains(item.getWorld().getName().toLowerCase(Locale.ROOT))) {
+            return true;
+        }
+        if (!excludedItems.isEmpty()) {
+            String type = item.getItemStack().getType().name();
+            for (Pattern pattern : excludedItems) {
+                if (pattern.matcher(type).matches()) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onItemSpawn(ItemSpawnEvent e) {
-        if (isNav(e.getEntity().getItemStack())) {
-            e.getEntity().remove();
+        Item item = e.getEntity();
+        ItemStack stack = item.getItemStack();
+        if (Tags.isTagged(stack)) {
+            item.remove();
             return;
         }
-        timers.put(e.getEntity().getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
+        timers.put(item.getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
+        PendingDeath death = pendingDeath;
+        if (death != null && death.location.getWorld().equals(item.getWorld())
+                && death.location.distanceSquared(item.getLocation()) < 9) {
+            for (Iterator<ItemStack> it = death.drops.iterator(); it.hasNext(); ) {
+                ItemStack drop = it.next();
+                if (drop.getAmount() == stack.getAmount() && drop.isSimilar(stack)) {
+                    owners.put(item.getUniqueId(), death.owner);
+                    it.remove();
+                    break;
+                }
+            }
+        }
+    }
+
+    @EventHandler(priority = EventPriority.LOWEST)
+    public void onDropTagged(PlayerDropItemEvent e) {
+        if (Tags.isTagged(e.getItemDrop().getItemStack())) {
+            e.getItemDrop().remove();
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onDrop(PlayerDropItemEvent e) {
+        owners.put(e.getItemDrop().getUniqueId(), new Owner(e.getPlayer().getUniqueId(), e.getPlayer().getName()));
+    }
+
+    /** Death drops spawn right after this event, in the same tick: remember them to tag their owner. */
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onDeath(PlayerDeathEvent e) {
+        if (e.getDrops().isEmpty() || (e.getKeepInventory())) {
+            return;
+        }
+        List<ItemStack> drops = new ArrayList<ItemStack>();
+        for (ItemStack drop : e.getDrops()) {
+            if (drop != null && drop.getAmount() > 0) {
+                drops.add(drop.clone());
+            }
+        }
+        Player player = e.getEntity();
+        pendingDeath = new PendingDeath(new Owner(player.getUniqueId(), player.getName()), player.getLocation(), drops);
+        getServer().getScheduler().runTask(this, () -> pendingDeath = null);
     }
 
     /** A pickup (even a partial one) counts as interaction: restart the item's timer. */
@@ -243,11 +345,20 @@ public class Unlooted extends JavaPlugin implements Listener {
         timers.put(item.getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
     }
 
+    /** Items of different owners never merge, so a reservation always covers exactly its owner's items. */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onMergeOwners(ItemMergeEvent e) {
+        if (!Objects.equals(owners.get(e.getEntity().getUniqueId()), owners.get(e.getTarget().getUniqueId()))) {
+            e.setCancelled(true);
+        }
+    }
+
     /** Like vanilla, a merged stack keeps the younger of the two ages. */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onMerge(ItemMergeEvent e) {
         long now = System.currentTimeMillis();
         Timer source = timers.remove(e.getEntity().getUniqueId());
+        owners.remove(e.getEntity().getUniqueId());
         Timer target = timers.get(e.getTarget().getUniqueId());
         long age = Math.min(source == null ? 0 : source.current(now), target == null ? 0 : target.current(now));
         timers.put(e.getTarget().getUniqueId(), new Timer(age, now, false));
@@ -306,9 +417,9 @@ public class Unlooted extends JavaPlugin implements Listener {
     // ------------------------------------------------------------------ global loot sweep
 
     /**
-     * Global loot timer. Scans every loaded item entity (this also catches items that
-     * mods spawn without firing ItemSpawnEvent) and loots all items whose own timer
-     * reached the delay at once. With force, every item is looted regardless of its timer.
+     * Global loot timer. Scans every loaded item entity (this also catches items that mods spawn
+     * without firing ItemSpawnEvent) and loots all items whose own timer reached the delay at once.
+     * With force, every item is looted regardless of its timer.
      *
      * @return the number of items looted
      */
@@ -339,49 +450,42 @@ public class Unlooted extends JavaPlugin implements Listener {
         for (Iterator<Map.Entry<UUID, Timer>> it = timers.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<UUID, Timer> entry = it.next();
             Timer t = entry.getValue();
-            if (seen.contains(entry.getKey())) {
-                continue;
-            }
-            if (!t.paused || now - t.lastUpdate > FORGET_UNLOADED_MS) {
+            if (!seen.contains(entry.getKey()) && (!t.paused || now - t.lastUpdate > FORGET_UNLOADED_MS)) {
                 it.remove();
             }
         }
+        owners.keySet().retainAll(timers.keySet());
 
-        return due.isEmpty() ? 0 : loot(due);
+        return due.isEmpty() ? 0 : loot(due, now);
     }
 
-    private int loot(List<Item> due) {
-        List<ItemStack> contents = drainPages();
-        Map<ItemStack, String> keys = new IdentityHashMap<ItemStack, String>();
+    private int loot(List<Item> due, long now) {
         int count = 0;
         int stacks = 0;
-
         for (Item item : due) {
             ItemStack stack = item.getItemStack();
-            if (isEmpty(stack) || isNav(stack)) {
-                timers.remove(item.getUniqueId());
+            UUID id = item.getUniqueId();
+            if (stack == null || stack.getAmount() <= 0 || Tags.isTagged(stack)) {
+                timers.remove(id);
+                owners.remove(id);
                 item.remove();
                 continue;
             }
-            ItemStack left = store(contents, stack.clone(), keys);
-            int moved = stack.getAmount() - (left == null ? 0 : left.getAmount());
-            if (moved > 0) {
-                count += moved;
+            Owner owner = priorityMs > 0 ? owners.get(id) : null;
+            boolean stored = storage.add(stack.clone(), owner == null ? null : owner.id, owner == null ? null : owner.name,
+                    owner == null ? 0 : now + priorityMs, maxGroups, now);
+            if (stored) {
+                count += stack.getAmount();
                 stacks++;
-            }
-            if (left == null) {
-                timers.remove(item.getUniqueId());
+                timers.remove(id);
+                owners.remove(id);
                 item.remove();
-            } else {
-                // Shared inventory reached max-pages: the rest stays on the ground for the next sweep.
-                item.setItemStack(left);
             }
+            // Otherwise max-pages is reached and the item needs a new entry: it stays on the ground.
         }
-
-        rebuildPages(contents);
-
         if (count > 0) {
-            save();
+            markDirty();
+            menu.refreshAll();
             Bukkit.broadcastMessage(ChatColor.translateAlternateColorCodes('&', broadcastMessage
                     .replace("{count}", String.valueOf(count))
                     .replace("{stacks}", String.valueOf(stacks))));
@@ -389,343 +493,28 @@ public class Unlooted extends JavaPlugin implements Listener {
         return count;
     }
 
-    /**
-     * Emptiness is judged by amount only. getType() is unreliable here: legacy-mode plugins on
-     * modern servers, and some modded servers, report items without a known Material as AIR.
-     */
-    private static boolean isEmpty(ItemStack stack) {
-        return stack == null || stack.getAmount() <= 0;
-    }
-
-    /** Adds a stack to the list, merging into similar stacks first. Returns what did not fit, or null. */
-    private ItemStack store(List<ItemStack> contents, ItemStack stack, Map<ItemStack, String> keys) {
-        int max = Math.max(1, stack.getMaxStackSize());
-        for (ItemStack existing : contents) {
-            if (stack.getAmount() <= 0) {
-                break;
-            }
-            if (existing.getAmount() < max && sameItem(existing, stack, keys)) {
-                int move = Math.min(max - existing.getAmount(), stack.getAmount());
-                existing.setAmount(existing.getAmount() + move);
-                stack.setAmount(stack.getAmount() - move);
-            }
-        }
-        while (stack.getAmount() > 0 && contents.size() < maxSlots) {
-            ItemStack part = stack.clone();
-            part.setAmount(Math.min(max, stack.getAmount()));
-            contents.add(part);
-            stack.setAmount(stack.getAmount() - part.getAmount());
-        }
-        return stack.getAmount() > 0 ? stack : null;
-    }
-
-    /**
-     * Bukkit's isSimilar ignores data it does not know about, such as Forge capabilities.
-     * Stacks are only merged when their full stored data matches too.
-     */
-    private boolean sameItem(ItemStack a, ItemStack b, Map<ItemStack, String> keys) {
-        if (!a.isSimilar(b)) {
-            return false;
-        }
-        if (!codec.isLossless()) {
-            return true;
-        }
-        String ka = key(a, keys);
-        String kb = key(b, keys);
-        return ka != null && ka.equals(kb);
-    }
-
-    private String key(ItemStack stack, Map<ItemStack, String> keys) {
-        if (!keys.containsKey(stack)) {
-            keys.put(stack, codec.key(stack));
-        }
-        return keys.get(stack);
-    }
-
-    // ------------------------------------------------------------------ dynamic shared inventory
-
-    private List<ItemStack> drainPages() {
-        List<ItemStack> contents = new ArrayList<ItemStack>();
-        for (Inventory page : pages) {
-            int itemSlots = ((PageHolder) page.getHolder()).itemSlots();
-            for (int i = 0; i < itemSlots; i++) {
-                ItemStack stack = page.getItem(i);
-                if (!isEmpty(stack) && !isNav(stack)) {
-                    contents.add(stack);
-                }
-            }
-        }
-        contents.addAll(displaced);
-        return contents;
-    }
-
-    /** Rebuilds the pages so each one is just big enough for its stacks, reopening them for viewers. */
-    private void rebuildPages(List<ItemStack> contents) {
-        Map<HumanEntity, Integer> viewers = new HashMap<HumanEntity, Integer>();
-        rebuilding = true;
-        try {
-            for (int i = 0; i < pages.size(); i++) {
-                for (HumanEntity viewer : new ArrayList<HumanEntity>(pages.get(i).getViewers())) {
-                    viewers.put(viewer, i);
-                    viewer.closeInventory();
-                }
-            }
-        } finally {
-            rebuilding = false;
-        }
-
-        pages.clear();
-        displaced.clear();
-        int total = (contents.size() + PAGE_SLOTS - 1) / PAGE_SLOTS;
-        for (int p = 0; p < total; p++) {
-            int from = p * PAGE_SLOTS;
-            int to = Math.min(contents.size(), from + PAGE_SLOTS);
-            int itemRows = (to - from + 8) / 9;
-            String title = total == 1 ? "Unlooted Items" : "Unlooted Items " + (p + 1) + "/" + total;
-            PageHolder holder = new PageHolder(p);
-            Inventory page = Bukkit.createInventory(holder, (itemRows + 1) * 9, title);
-            holder.inventory = page;
-            for (int i = from; i < to; i++) {
-                page.setItem(i - from, contents.get(i));
-            }
-            fillNavigationBar(page, p, total);
-            pages.add(page);
-        }
-
-        for (Map.Entry<HumanEntity, Integer> entry : viewers.entrySet()) {
-            HumanEntity viewer = entry.getKey();
-            if (!pages.isEmpty() && viewer instanceof Player && ((Player) viewer).isOnline()) {
-                viewer.openInventory(pages.get(Math.min(entry.getValue(), pages.size() - 1)));
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------ navigation bar
-
-    private void fillNavigationBar(Inventory page, int index, int total) {
-        ItemStack[] bar = navigationBar(index, total);
-        int start = page.getSize() - 9;
-        for (int i = 0; i < 9; i++) {
-            page.setItem(start + i, bar[i]);
-        }
-    }
-
-    /** The nine panes of a page's navigation bar, left to right. */
-    private static ItemStack[] navigationBar(int index, int total) {
-        ItemStack[] bar = new ItemStack[9];
-        ItemStack filler = glassPane("BLACK", 15, ChatColor.GRAY + "Page " + (index + 1) + "/" + total,
-                ChatColor.DARK_GRAY + "Navigation bar, not lootable");
-        Arrays.fill(bar, filler);
-        if (index > 0) {
-            bar[0] = glassPane("RED", 14, ChatColor.RED + "\u00AB Previous page",
-                    ChatColor.GRAY + "Go to page " + index + "/" + total);
-        }
-        if (index < total - 1) {
-            bar[8] = glassPane("GREEN", 13, ChatColor.GREEN + "Next page \u00BB",
-                    ChatColor.GRAY + "Go to page " + (index + 2) + "/" + total);
-        }
-        return bar;
-    }
-
-    static boolean isNav(ItemStack stack) {
-        if (stack == null || stack.getAmount() <= 0 || !stack.hasItemMeta()) {
-            return false;
-        }
-        ItemMeta meta = stack.getItemMeta();
-        if (meta == null || !meta.hasLore()) {
-            return false;
-        }
-        List<String> lore = meta.getLore();
-        for (String line : lore) {
-            if (line.endsWith(NAV_TAG)) {
-                return true;
-            }
-        }
-        // Untagged panes handed out by 0.2.0, recognised by their exact colored lore.
-        return lore.size() == 1 && (lore.get(0).equals(ChatColor.DARK_GRAY + "Navigation bar, not lootable")
-                || lore.get(0).matches(Pattern.quote(ChatColor.GRAY + "Go to page ") + "\\d+/\\d+"));
-    }
-
-    /** Repairs every storage page someone has open, and takes back any pane that ended up with a player. */
-    private void guardOpenPages() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            Inventory top = player.getOpenInventory().getTopInventory();
-            PageHolder page = pageOf(top);
-            if (page == null) {
-                continue;
-            }
-            if (page.index < pages.size() && pages.get(page.index) == top) {
-                repairPage(top, page.index, pages.size());
-            }
-            purgePanes(player);
-        }
-    }
-
-    /**
-     * Puts the navigation bar back in place. Panes found among the items are removed. Stored items
-     * found in the bar are moved back into the item area, or kept aside if the page is full. Nothing is deleted.
-     */
-    private void repairPage(Inventory page, int index, int total) {
-        int itemSlots = page.getSize() - 9;
-        for (int i = 0; i < itemSlots; i++) {
-            if (isNav(page.getItem(i))) {
-                page.setItem(i, null);
-            }
-        }
-        ItemStack[] bar = navigationBar(index, total);
-        for (int i = 0; i < 9; i++) {
-            ItemStack current = page.getItem(itemSlots + i);
-            if (current != null && current.getAmount() == 1 && current.isSimilar(bar[i])) {
-                continue;
-            }
-            if (!isEmpty(current) && !isNav(current)) {
-                int free = -1;
-                for (int j = 0; j < itemSlots && free < 0; j++) {
-                    if (isEmpty(page.getItem(j))) {
-                        free = j;
-                    }
-                }
-                if (free >= 0) {
-                    page.setItem(free, current);
-                } else {
-                    displaced.add(current.clone());
-                }
-            }
-            page.setItem(itemSlots + i, bar[i]);
-        }
-    }
-
-    /** Removes navigation panes from a player's inventory and cursor. */
-    private static void purgePanes(HumanEntity player) {
-        if (isNav(player.getItemOnCursor())) {
-            player.setItemOnCursor(null);
-        }
-        PlayerInventory inventory = player.getInventory();
-        ItemStack[] contents = inventory.getContents();
-        for (int i = 0; i < contents.length; i++) {
-            if (isNav(contents[i])) {
-                inventory.setItem(i, null);
-            }
-        }
-    }
-
-    @EventHandler
-    public void onJoin(PlayerJoinEvent e) {
-        purgePanes(e.getPlayer());
-    }
-
-    @EventHandler(priority = EventPriority.LOWEST)
-    public void onDrop(PlayerDropItemEvent e) {
-        if (isNav(e.getItemDrop().getItemStack())) {
-            e.getItemDrop().remove();
-        }
-    }
-
-    /** A stained glass pane, using the modern material name when it exists and 1.12 color data otherwise. */
-    private static ItemStack glassPane(String color, int legacyData, String name, String lore) {
-        Material type = Material.getMaterial(color + "_STAINED_GLASS_PANE");
-        short data = 0;
-        if (type == null) {
-            type = Material.getMaterial("STAINED_GLASS_PANE");
-            data = (short) legacyData;
-        }
-        ItemStack pane = new ItemStack(type, 1, data);
-        ItemMeta meta = pane.getItemMeta();
-        meta.setDisplayName(name);
-        meta.setLore(Collections.singletonList(lore + NAV_TAG));
-        pane.setItemMeta(meta);
-        return pane;
-    }
-
-    private static PageHolder pageOf(Inventory inventory) {
-        InventoryHolder holder = inventory == null ? null : inventory.getHolder();
-        return holder instanceof PageHolder ? (PageHolder) holder : null;
-    }
-
-    /** The navigation bar can never be taken or changed. Its red and green panes switch pages. */
-    @EventHandler(priority = EventPriority.LOWEST)
-    public void onClick(InventoryClickEvent e) {
-        Inventory top = e.getView().getTopInventory();
-        PageHolder page = pageOf(top);
-        if (page == null) {
-            return;
-        }
-        int raw = e.getRawSlot();
-        if (raw < page.itemSlots() || raw >= top.getSize()) {
-            return;
-        }
-        e.setCancelled(true);
-        int target = raw == page.itemSlots() ? page.index - 1 : raw == top.getSize() - 1 ? page.index + 1 : -1;
-        if (target >= 0 && target < pages.size() && e.getWhoClicked() instanceof Player) {
-            final Player player = (Player) e.getWhoClicked();
-            final int index = target;
-            // Opening another inventory inside a click event is unsafe, so do it on the next tick.
-            getServer().getScheduler().runTask(this, () -> {
-                if (player.isOnline() && index < pages.size()) {
-                    player.openInventory(pages.get(index));
-                }
-            });
-        }
-    }
-
-    @EventHandler(priority = EventPriority.LOWEST)
-    public void onDrag(InventoryDragEvent e) {
-        Inventory top = e.getView().getTopInventory();
-        PageHolder page = pageOf(top);
-        if (page == null) {
-            return;
-        }
-        for (int raw : e.getRawSlots()) {
-            if (raw >= page.itemSlots() && raw < top.getSize()) {
-                e.setCancelled(true);
-                return;
-            }
-        }
-    }
-
-    /** Once nobody looks at the shared inventory any more, shrink it to what is left. */
-    @EventHandler
-    public void onClose(InventoryCloseEvent e) {
-        if (pageOf(e.getInventory()) != null) {
-            // The cursor item goes back to the player after this event, so check again next tick.
-            final HumanEntity player = e.getPlayer();
-            purgePanes(player);
-            if (isEnabled()) {
-                getServer().getScheduler().runTask(this, () -> purgePanes(player));
-            }
-        }
-        if (rebuilding || !isEnabled() || pageOf(e.getInventory()) == null || compactQueued) {
-            return;
-        }
-        compactQueued = true;
-        getServer().getScheduler().runTask(this, () -> {
-            compactQueued = false;
-            for (Inventory page : pages) {
-                if (!page.getViewers().isEmpty()) {
-                    return;
-                }
-            }
-            rebuildPages(drainPages());
-            save();
-        });
-    }
+    // ------------------------------------------------------------------ commands
 
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String label, String[] args) {
-        if (args.length > 0 && args[0].equalsIgnoreCase("loot")) {
-            return forceLoot(sender, label, args);
+        String sub = args.length > 0 ? args[0].toLowerCase(Locale.ROOT) : "";
+        switch (sub) {
+            case "loot":
+                return forceLoot(sender, label, args);
+            case "clear":
+                return clear(sender, label, args);
+            case "reload":
+                return reload(sender);
+            case "config":
+                return configCommand(sender, label, args);
+            default:
+                return openStorage(sender, label, args);
         }
-        if (args.length > 0 && args[0].equalsIgnoreCase("clear")) {
-            return clear(sender, label, args);
-        }
-        if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
-            return reload(sender);
-        }
-        if (args.length > 0 && args[0].equalsIgnoreCase("config")) {
-            return configCommand(sender, label, args);
-        }
+    }
+
+    private boolean openStorage(CommandSender sender, String label, String[] args) {
         if (!(sender instanceof Player)) {
-            sender.sendMessage("Only players can open the shared inventory.");
+            sender.sendMessage("Only players can open the storage.");
             return true;
         }
         Player p = (Player) sender;
@@ -733,10 +522,11 @@ public class Unlooted extends JavaPlugin implements Listener {
             p.sendMessage(ChatColor.RED + "You don't have permission.");
             return true;
         }
-        if (pages.isEmpty()) {
+        if (storage.isEmpty()) {
             p.sendMessage(ChatColor.YELLOW + "There are no auto-looted items right now.");
             return true;
         }
+        int pages = Menu.listPages(storage.groups().size());
         int page = 1;
         if (args.length > 0) {
             try {
@@ -746,11 +536,11 @@ public class Unlooted extends JavaPlugin implements Listener {
                 return true;
             }
         }
-        if (page < 1 || page > pages.size()) {
-            p.sendMessage(ChatColor.RED + "Page must be between 1 and " + pages.size() + ".");
+        if (page < 1 || page > pages) {
+            p.sendMessage(ChatColor.RED + "Page must be between 1 and " + pages + ".");
             return true;
         }
-        p.openInventory(pages.get(page - 1));
+        menu.openList(p, page - 1);
         return true;
     }
 
@@ -765,8 +555,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             sender.sendMessage(ChatColor.RED + "Usage: /" + label + " loot [all]");
             return true;
         }
-        int count = sweep(all);
-        if (count == 0) {
+        if (sweep(all) == 0) {
             sender.sendMessage(ChatColor.YELLOW + (all
                     ? "There were no items on the ground to loot."
                     : "No item has been on the ground long enough. Use /" + label + " loot all to loot everything."));
@@ -774,26 +563,21 @@ public class Unlooted extends JavaPlugin implements Listener {
         return true;
     }
 
-    /** /unlooted clear [confirm]: permanently deletes everything in the shared storage. */
+    /** /unlooted clear [confirm]: permanently deletes everything in the storage. */
     private boolean clear(CommandSender sender, String label, String[] args) {
         if (!sender.hasPermission("unlooted.admin")) {
             sender.sendMessage(ChatColor.RED + "You don't have permission.");
             return true;
         }
         long now = System.currentTimeMillis();
-        List<ItemStack> contents = drainPages();
-        int items = 0;
-        for (ItemStack stack : contents) {
-            items += stack.getAmount();
-        }
-        int stacks = contents.size() + unreadable.size();
-        String summary = items + " item(s) in " + stacks + " stack(s)"
-                + (unreadable.isEmpty() ? "" : ", including " + unreadable.size() + " stack(s) from missing mods");
+        int entries = storage.groups().size() + storage.unreadable.size();
+        String summary = Menu.number(storage.totalItems()) + " item(s) of " + storage.groups().size() + " kind(s)"
+                + (storage.unreadable.isEmpty() ? "" : ", plus " + storage.unreadable.size() + " entry(s) from missing mods");
 
         boolean confirming = args.length > 1 && args[1].equalsIgnoreCase("confirm");
         Long asked = pendingClears.get(sender.getName());
         if (!confirming || asked == null || now - asked > CLEAR_CONFIRM_MS) {
-            if (stacks == 0) {
+            if (entries == 0) {
                 sender.sendMessage(ChatColor.YELLOW + "The storage is already empty.");
                 pendingClears.remove(sender.getName());
                 return true;
@@ -805,9 +589,9 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
 
         pendingClears.remove(sender.getName());
-        rebuildPages(new ArrayList<ItemStack>());
-        unreadable.clear();
-        save();
+        menu.closeAll();
+        storage.clear();
+        save(false);
         getLogger().info(sender.getName() + " cleared the storage, deleting " + summary + ".");
         sender.sendMessage(ChatColor.GREEN + "Storage cleared. Deleted " + summary + ".");
         return true;
@@ -838,7 +622,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             }
             return true;
         }
-        String key = args[1].toLowerCase();
+        String key = args[1].toLowerCase(Locale.ROOT);
         if (!SETTINGS.containsKey(key)) {
             sender.sendMessage(ChatColor.RED + "Unknown setting " + args[1] + ". Settings: " + String.join(", ", SETTINGS.keySet()));
             return true;
@@ -856,9 +640,10 @@ public class Unlooted extends JavaPlugin implements Listener {
             switch (key) {
                 case "loot-delay-seconds":
                 case "loot-interval-seconds":
+                case "owner-priority-seconds":
                 case "max-pages":
                     long number = Long.parseLong(raw);
-                    long min = key.equals("max-pages") ? 0 : 1;
+                    long min = key.equals("max-pages") || key.equals("owner-priority-seconds") ? 0 : 1;
                     if (number < min || number > Integer.MAX_VALUE) {
                         throw new NumberFormatException();
                     }
@@ -872,9 +657,26 @@ public class Unlooted extends JavaPlugin implements Listener {
                     value = Boolean.parseBoolean(raw);
                     yaml = String.valueOf(value);
                     break;
+                case "excluded-worlds":
+                case "excluded-items":
+                    List<String> list = new ArrayList<String>();
+                    if (!raw.equalsIgnoreCase("none")) {
+                        for (String part : raw.split(",")) {
+                            if (!part.trim().isEmpty()) {
+                                list.add(part.trim());
+                            }
+                        }
+                    }
+                    List<String> quoted = new ArrayList<String>();
+                    for (String entry : list) {
+                        quoted.add(quote(entry));
+                    }
+                    value = list;
+                    yaml = "[" + String.join(", ", quoted) + "]";
+                    break;
                 default:
                     value = raw;
-                    yaml = "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+                    yaml = quote(raw);
             }
         } catch (NumberFormatException ex) {
             sender.sendMessage(ChatColor.RED + "Invalid value for " + key + ": expected " + SETTINGS.get(key) + ".");
@@ -894,6 +696,10 @@ public class Unlooted extends JavaPlugin implements Listener {
         return true;
     }
 
+    private static String quote(String raw) {
+        return "\"" + raw.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
     /**
      * Replaces one top-level key in config.yml, keeping every comment and other line as it is.
      * Bukkit's saveConfig() would strip all comments from the file.
@@ -909,6 +715,10 @@ public class Unlooted extends JavaPlugin implements Listener {
             if (line.matcher(lines.get(i)).matches()) {
                 lines.set(i, key + ": " + yaml);
                 replaced = true;
+                // A list written in block style continues on the following "- " lines: drop them.
+                while (i + 1 < lines.size() && lines.get(i + 1).trim().startsWith("- ")) {
+                    lines.remove(i + 1);
+                }
                 break;
             }
         }
@@ -924,36 +734,48 @@ public class Unlooted extends JavaPlugin implements Listener {
     @Override
     public List<String> onTabComplete(CommandSender sender, Command cmd, String alias, String[] args) {
         List<String> out = new ArrayList<String>();
+        boolean admin = sender.hasPermission("unlooted.admin");
         if (args.length == 1) {
-            if ("loot".startsWith(args[0].toLowerCase()) && sender.hasPermission("unlooted.loot")) {
+            String typed = args[0].toLowerCase(Locale.ROOT);
+            if ("loot".startsWith(typed) && sender.hasPermission("unlooted.loot")) {
                 out.add("loot");
             }
             for (String sub : new String[] {"clear", "reload", "config"}) {
-                if (sub.startsWith(args[0].toLowerCase()) && sender.hasPermission("unlooted.admin")) {
+                if (sub.startsWith(typed) && admin) {
                     out.add(sub);
                 }
             }
-            for (int i = 1; i <= pages.size(); i++) {
+            for (int i = 1; i <= Menu.listPages(storage.groups().size()) && !storage.isEmpty(); i++) {
                 if (String.valueOf(i).startsWith(args[0])) {
                     out.add(String.valueOf(i));
                 }
             }
-        } else if (args.length == 2 && args[0].equalsIgnoreCase("loot") && "all".startsWith(args[1].toLowerCase())) {
-            out.add("all");
-        } else if (args.length == 2 && args[0].equalsIgnoreCase("clear") && "confirm".startsWith(args[1].toLowerCase())
-                && sender.hasPermission("unlooted.admin")) {
-            out.add("confirm");
-        } else if (args.length == 2 && args[0].equalsIgnoreCase("config") && sender.hasPermission("unlooted.admin")) {
-            for (String key : SETTINGS.keySet()) {
-                if (key.startsWith(args[1].toLowerCase())) {
-                    out.add(key);
+        } else if (args.length == 2) {
+            String typed = args[1].toLowerCase(Locale.ROOT);
+            if (args[0].equalsIgnoreCase("loot") && "all".startsWith(typed)) {
+                out.add("all");
+            } else if (args[0].equalsIgnoreCase("clear") && admin && "confirm".startsWith(typed)) {
+                out.add("confirm");
+            } else if (args[0].equalsIgnoreCase("config") && admin) {
+                for (String key : SETTINGS.keySet()) {
+                    if (key.startsWith(typed)) {
+                        out.add(key);
+                    }
                 }
             }
-        } else if (args.length == 3 && args[0].equalsIgnoreCase("config")
-                && args[1].equalsIgnoreCase("ignore-unpickupable-items") && sender.hasPermission("unlooted.admin")) {
-            for (String b : new String[] {"true", "false"}) {
-                if (b.startsWith(args[2].toLowerCase())) {
-                    out.add(b);
+        } else if (args.length == 3 && args[0].equalsIgnoreCase("config") && admin) {
+            String typed = args[2].toLowerCase(Locale.ROOT);
+            if (args[1].equalsIgnoreCase("ignore-unpickupable-items")) {
+                for (String b : new String[] {"true", "false"}) {
+                    if (b.startsWith(typed)) {
+                        out.add(b);
+                    }
+                }
+            } else if (args[1].equalsIgnoreCase("excluded-worlds")) {
+                for (World world : Bukkit.getWorlds()) {
+                    if (world.getName().toLowerCase(Locale.ROOT).startsWith(typed)) {
+                        out.add(world.getName());
+                    }
                 }
             }
         }
@@ -962,91 +784,128 @@ public class Unlooted extends JavaPlugin implements Listener {
 
     // ------------------------------------------------------------------ persistence
 
-    private void save() {
+    /**
+     * Saves storage and timers. The snapshot is taken on the main thread; turning it into YAML and
+     * writing the file happen in the background, except on shutdown or under Bukkit serialization.
+     * Every save gets a sequence number so an older background write can never replace a newer one.
+     */
+    private void save(boolean sync) {
         if (storageBroken) {
             return;
         }
-        YamlConfiguration yml = new YamlConfiguration();
-        List<Object> items = new ArrayList<Object>();
-        for (ItemStack stack : drainPages()) {
-            items.add(codec.encode(stack));
-        }
-        items.addAll(unreadable);
-        yml.set("items", items);
+        final Map<String, Object> root = new LinkedHashMap<String, Object>();
+        root.put("format", 2);
+        root.put("groups", storage.snapshot());
         long now = System.currentTimeMillis();
+        Map<String, Object> timerData = new LinkedHashMap<String, Object>();
         for (Map.Entry<UUID, Timer> entry : timers.entrySet()) {
-            yml.set("timers." + entry.getKey(), entry.getValue().current(now));
-        }
-        // Write to a temporary file first, so a crash mid-save never leaves a half-written data.yml.
-        File tmp = new File(getDataFolder(), "data.yml.tmp");
-        try {
-            getDataFolder().mkdirs();
-            yml.save(tmp);
-            try {
-                Files.move(tmp.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-            } catch (AtomicMoveNotSupportedException ex) {
-                Files.move(tmp.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            Map<String, Object> t = new LinkedHashMap<String, Object>();
+            t.put("age", entry.getValue().current(now));
+            Owner owner = owners.get(entry.getKey());
+            if (owner != null) {
+                t.put("owner", owner.id.toString());
+                t.put("owner-name", owner.name);
             }
-        } catch (IOException ex) {
-            getLogger().log(Level.SEVERE, "Could not save data.yml", ex);
+            timerData.put(entry.getKey().toString(), t);
+        }
+        root.put("timers", timerData);
+        dirty = false;
+        final long seq = ++saveSeq;
+        if (sync || !codec.isLossless()) {
+            write(seq, dump(root));
+        } else {
+            getServer().getScheduler().runTaskAsynchronously(this, () -> write(seq, dump(root)));
+        }
+    }
+
+    private static String dump(Map<String, Object> root) {
+        YamlConfiguration yml = new YamlConfiguration();
+        for (Map.Entry<String, Object> entry : root.entrySet()) {
+            yml.set(entry.getKey(), entry.getValue());
+        }
+        return yml.saveToString();
+    }
+
+    /** Writes to a temporary file first, so a crash mid-save never leaves a half-written data.yml. */
+    private void write(long seq, String text) {
+        synchronized (writeLock) {
+            if (seq <= writtenSeq) {
+                return;
+            }
+            File tmp = new File(getDataFolder(), "data.yml.tmp");
+            try {
+                getDataFolder().mkdirs();
+                Files.write(tmp.toPath(), text.getBytes(StandardCharsets.UTF_8));
+                try {
+                    Files.move(tmp.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException ex) {
+                    Files.move(tmp.toPath(), dataFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+                writtenSeq = seq;
+            } catch (IOException ex) {
+                getLogger().log(Level.SEVERE, "Could not save data.yml", ex);
+            }
         }
     }
 
     private void load() {
-        List<ItemStack> contents = new ArrayList<ItemStack>();
-        if (dataFile.exists()) {
-            YamlConfiguration yml = new YamlConfiguration();
-            try {
-                yml.load(dataFile);
-            } catch (IOException | InvalidConfigurationException ex) {
-                // Never overwrite stored items we failed to read: move the file aside and start fresh.
-                File broken = new File(getDataFolder(), "data.yml.broken-" + System.currentTimeMillis());
-                if (dataFile.renameTo(broken)) {
-                    getLogger().log(Level.SEVERE, "data.yml could not be read and was moved to " + broken.getName()
-                            + ". Its items are not lost, fix or restore the file and restart.", ex);
+        if (!dataFile.exists()) {
+            return;
+        }
+        YamlConfiguration yml = new YamlConfiguration();
+        try {
+            yml.load(dataFile);
+        } catch (IOException | InvalidConfigurationException ex) {
+            // Never overwrite stored items we failed to read: move the file aside and start fresh.
+            File broken = new File(getDataFolder(), "data.yml.broken-" + System.currentTimeMillis());
+            if (dataFile.renameTo(broken)) {
+                getLogger().log(Level.SEVERE, "data.yml could not be read and was moved to " + broken.getName()
+                        + ". Its items are not lost, fix or restore the file and restart.", ex);
+            } else {
+                getLogger().log(Level.SEVERE, "data.yml could not be read. Disabling Unlooted so it is not overwritten.", ex);
+                storageBroken = true;
+            }
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        storage.load(yml.getList("groups"), yml.getList("items"), now);
+        if (!storage.unreadable.isEmpty()) {
+            getLogger().warning(storage.unreadable.size() + " stored item(s) could not be loaded, probably because"
+                    + " the mod that adds them is missing. They stay in data.yml and load again once it is back.");
+        }
+
+        ConfigurationSection section = yml.getConfigurationSection("timers");
+        if (section != null) {
+            for (String key : section.getKeys(false)) {
+                UUID id;
+                try {
+                    id = UUID.fromString(key);
+                } catch (IllegalArgumentException ignored) {
+                    continue;
+                }
+                long age;
+                if (section.isConfigurationSection(key)) {
+                    ConfigurationSection t = section.getConfigurationSection(key);
+                    age = t.getLong("age");
+                    String owner = t.getString("owner");
+                    if (owner != null) {
+                        try {
+                            owners.put(id, new Owner(UUID.fromString(owner), t.getString("owner-name", "its owner")));
+                        } catch (IllegalArgumentException ignored) {
+                            // Unknown owner: the item becomes shared.
+                        }
+                    }
                 } else {
-                    getLogger().log(Level.SEVERE, "data.yml could not be read. Disabling Unlooted so it is not overwritten.", ex);
-                    storageBroken = true;
-                    return;
+                    age = section.getLong(key);
                 }
-                yml = new YamlConfiguration();
-            }
-            List<?> list = yml.getList("items");
-            if (list != null) {
-                for (Object o : list) {
-                    if (o == null) {
-                        continue;
-                    }
-                    ItemStack stack;
-                    try {
-                        stack = codec.decode(o);
-                    } catch (Exception ex) {
-                        stack = null;
-                    }
-                    if (stack != null && !isEmpty(stack)) {
-                        contents.add(stack);
-                    } else {
-                        unreadable.add(o);
-                    }
-                }
-                if (!unreadable.isEmpty()) {
-                    getLogger().warning(unreadable.size() + " stored item(s) could not be loaded, probably because"
-                            + " the mod that adds them is missing. They stay in data.yml and load again once it is back.");
-                }
-            }
-            ConfigurationSection section = yml.getConfigurationSection("timers");
-            if (section != null) {
-                long now = System.currentTimeMillis();
-                for (String key : section.getKeys(false)) {
-                    try {
-                        // Paused until the item is seen in a loaded chunk again.
-                        timers.put(UUID.fromString(key), new Timer(section.getLong(key), now, true));
-                    } catch (IllegalArgumentException ignored) {
-                        // Corrupt key: skip it.
-                    }
-                }
+                // Paused until the item is seen in a loaded chunk again.
+                timers.put(id, new Timer(age, now, true));
             }
         }
-        rebuildPages(contents);
+        if (yml.contains("items")) {
+            // Converted from the old format: write the new one straight away.
+            dirty = true;
+        }
     }
 }

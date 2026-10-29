@@ -50,6 +50,9 @@ final class ItemCodec {
     private Method writeCompressed;
     private boolean nbtOk;
 
+    /** The server's own, stack-aware max stack size (Forge's getItemStackLimit, item components...). */
+    private Method nmsMaxStack;
+
     ItemCodec(Logger log) {
         this.log = log;
         try {
@@ -67,6 +70,11 @@ final class ItemCodec {
             if (!paperOk) {
                 log.log(Level.FINE, "Raw NBT item storage unavailable", t);
             }
+        }
+        try {
+            findMaxStack();
+        } catch (Throwable ignored) {
+            nmsMaxStack = null;
         }
         if (paperOk) {
             log.info("Storing items in Paper's lossless item format.");
@@ -128,17 +136,48 @@ final class ItemCodec {
     }
 
     /**
-     * A string that is equal for two stacks exactly when they hold the same item with the same data,
-     * ignoring the amount. Null when no lossless format is available.
+     * The item's complete raw data as a comparable object, or null when raw NBT is unavailable.
+     * Pass a stack with amount 1 so the amount doesn't take part in comparisons.
      */
-    String key(ItemStack stack) {
-        if (!isLossless()) {
+    Object fingerprint(ItemStack one) {
+        if (!nbtOk) {
             return null;
         }
-        ItemStack one = stack.clone();
-        one.setAmount(1);
-        Object encoded = encode(one);
-        return encoded instanceof String ? (String) encoded : null;
+        try {
+            return nmsSave.invoke(asNmsCopy.invoke(null, one), compoundCtor.newInstance());
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /**
+     * True when two stacks hold the same item with the same data. Bukkit's isSimilar misses data it
+     * doesn't know, such as Forge capabilities, so the raw NBT is compared too when it is available.
+     * NBT compounds compare by content, so key order doesn't matter.
+     */
+    boolean sameData(ItemStack a, Object fingerprintA, ItemStack b, Object fingerprintB) {
+        if (!a.isSimilar(b)) {
+            return false;
+        }
+        if (fingerprintA != null && fingerprintB != null) {
+            return fingerprintA.equals(fingerprintB);
+        }
+        return true;
+    }
+
+    /** How many of this item fit in one stack, asking the server itself when possible. */
+    int maxStackSize(ItemStack stack) {
+        if (nmsMaxStack != null && asNmsCopy != null) {
+            try {
+                int max = (Integer) nmsMaxStack.invoke(asNmsCopy.invoke(null, stack));
+                if (max > 0) {
+                    return max;
+                }
+            } catch (Throwable ignored) {
+                // Fall back to Bukkit below.
+            }
+        }
+        return Math.max(1, stack.getMaxStackSize());
     }
 
     // ------------------------------------------------------------------ internals
@@ -228,6 +267,33 @@ final class ItemCodec {
             }
         }
         throw new IllegalStateException("No compressed NBT reader and writer");
+    }
+
+    /**
+     * The internal stack's max size method. On Forge hybrids it is patched to ask the item, so mods that
+     * limit stacks by their data are respected. Names: Spigot and Mojang mappings, then Forge's SRG name.
+     */
+    private void findMaxStack() throws Exception {
+        String craftPackage = Bukkit.getServer().getClass().getPackage().getName();
+        Class<?> craftItemStack = Class.forName(craftPackage + ".inventory.CraftItemStack");
+        if (asNmsCopy == null) {
+            asNmsCopy = craftItemStack.getMethod("asNMSCopy", ItemStack.class);
+        }
+        Class<?> nmsItem = asNmsCopy.getReturnType();
+        for (String name : new String[] {"getMaxStackSize", "func_77976_d"}) {
+            try {
+                Method m = nmsItem.getMethod(name);
+                if (m.getReturnType() == int.class) {
+                    nmsMaxStack = m;
+                    if (maxStackSize(new ItemStack(Material.STONE)) == 64) {
+                        return;
+                    }
+                    nmsMaxStack = null;
+                }
+            } catch (NoSuchMethodException ignored) {
+                // Try the next name.
+            }
+        }
     }
 
     private static boolean isCompound(Class<?> type) {

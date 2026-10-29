@@ -2,10 +2,10 @@ name: Unlooted
 main: me.unlooted.Unlooted
 version: ${project.version}
 api-version: 1.13
-description: Auto-loots items left on the ground into a shared, self-resizing inventory.
+description: Auto-loots items left on the ground into a shared, grouped storage.
 commands:
   unlooted:
-    description: Open the shared unlooted-items inventory.
+    description: Open the shared storage of auto-looted items.
     aliases: [ul, unlootedbin]
     usage: /<command> [page] | loot [all] | clear | reload | config [key] [value]
 permissions:
@@ -16,5 +16,5 @@ permissions:
     description: Force the auto-loot sweep to run immediately
     default: op
   unlooted.admin:
-    description: Clear the storage, reload and change the Unlooted config
+    description: Clear the storage, change the config, and take reserved items
     default: op
