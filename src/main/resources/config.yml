@@ -83,3 +83,6 @@ messages:
   search-lore: "&7Type /ul search <text>"
   search-active: "&bSearch: {query}"
   search-active-lore: "&7Click to clear"
+
+# Used by the plugin to update this file after a plugin update. Don't change it.
+config-version: 2

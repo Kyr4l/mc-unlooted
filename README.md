@@ -52,6 +52,8 @@ Lowering `max-pages` never deletes stored items. It only stops new kinds of item
 
 See [config.yml](src/main/resources/config.yml).
 
+After a plugin update, `config.yml` updates itself on the next start. New settings and messages are added with their comments, and every value you set is kept. Settings the new version no longer uses are moved to the end of the file as comments. The old file is saved as `config.yml.backup-<version>` first. Comments you wrote yourself are only kept in that backup.
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `loot-delay-seconds` | `300` | Time an item must lie untouched before it can be looted |

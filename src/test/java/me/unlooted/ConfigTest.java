@@ -20,7 +20,7 @@ public class ConfigTest {
         yml.load(new InputStreamReader(ConfigTest.class.getResourceAsStream("/config.yml"), StandardCharsets.UTF_8));
         for (String key : new String[] {"loot-delay-seconds", "loot-interval-seconds", "owner-priority-seconds",
                 "expire-after-days", "combat-block-seconds", "max-pages", "excluded-worlds", "excluded-items",
-                "ignore-unpickupable-items", "broadcast-message"}) {
+                "ignore-unpickupable-items", "broadcast-message", "config-version"}) {
             assertTrue("config.yml lacks " + key, yml.contains(key));
         }
         assertNotNull(yml.getConfigurationSection("messages"));

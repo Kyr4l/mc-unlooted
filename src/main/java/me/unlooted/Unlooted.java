@@ -180,6 +180,13 @@ public class Unlooted extends JavaPlugin implements Listener {
     @Override
     public void onEnable() {
         saveDefaultConfig();
+        try {
+            if (ConfigUpdater.update(new File(getDataFolder(), "config.yml"), getResource("config.yml"), getLogger())) {
+                reloadConfig();
+            }
+        } catch (IOException ex) {
+            getLogger().log(Level.WARNING, "Could not update config.yml, using it as it is.", ex);
+        }
         dataFile = new File(getDataFolder(), "data.yml");
         Tags.init(this);
         codec = new ItemCodec(getLogger());
