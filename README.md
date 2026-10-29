@@ -14,7 +14,7 @@ Bukkit plugin for Minecraft 1.12.1 that collects items left lying on the ground 
 - **Take-only.** The storage is a menu, not a chest. Players can only take items, never put any in.
 - **Owner first.** Items a player dropped or lost on death are reserved for them for `owner-priority-seconds` after they are looted. The owner gets a message when it happens, and again on login while items are waiting. Others see them marked as reserved. Admins can always take them.
 - **Combat block.** Players can't open the storage for `combat-block-seconds` after a player-versus-player hit, and an open storage closes when they are hit.
-- **Take log.** Every take is written to `plugins/Unlooted/takes.log`. Admins can view the latest with `/unlooted log`.
+- **Take log.** Every take is printed to the server console, so it ends up in the server's own log. Admins can view the latest since the last restart with `/unlooted log`.
 - **Editable messages.** Every text players see is in the `messages` section of `config.yml`.
 - **Exploit-proof menu.** Every icon is a tagged display copy, using a hidden data tag on modern servers. The open menu is checked every tick against what was placed in it, so sorting mods can't move anything. A real item moved in only goes back if it left the player's inventory, so copies are deleted rather than duplicated. A menu icon that escapes is removed from inventories, chests, drops and the ground, creative-mode copies are refused, and blocked clicks are resent to the client so no ghost items stay.
 - **Broadcast.** After a sweep that looted something, the plugin announces how many items were collected. Nothing is sent when a sweep looted nothing.

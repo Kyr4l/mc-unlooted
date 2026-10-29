@@ -303,9 +303,6 @@ public class Unlooted extends JavaPlugin implements Listener {
         if (storage != null) {
             save(true);
         }
-        if (takeLog != null) {
-            takeLog.flush();
-        }
     }
 
     void markDirty() {
@@ -329,8 +326,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         if (removed > 0) {
             markDirty();
             menu.refreshAll();
-            getLogger().info("Deleted " + removed + " stored item(s) older than the expire-after-days setting.");
-            log("Expiry deleted " + removed + " item(s)");
+            log("Expiry deleted " + removed + " stored item(s) older than the expire-after-days setting.");
         }
     }
 
@@ -789,10 +785,10 @@ public class Unlooted extends JavaPlugin implements Listener {
         String filter = args.length > 1 ? args[1] : null;
         List<String> lines = takeLog.latest(filter, 15);
         if (lines.isEmpty()) {
-            sender.sendMessage(ChatColor.YELLOW + "No matching entries since the last restart. Older ones are in takes.log.");
+            sender.sendMessage(ChatColor.YELLOW + "No matching entries since the last restart. Older ones are in the server log.");
             return true;
         }
-        sender.sendMessage(ChatColor.YELLOW + "Latest takes, newest first. The full history is in plugins/Unlooted/takes.log.");
+        sender.sendMessage(ChatColor.YELLOW + "Latest takes since the last restart, newest first. Older ones are in the server log.");
         for (String line : lines) {
             sender.sendMessage(ChatColor.GRAY + line);
         }
@@ -897,8 +893,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         menu.closeAll();
         storage.clear();
         save(false);
-        getLogger().info(sender.getName() + " cleared the storage, deleting " + summary + ".");
-        log(sender.getName() + " cleared the storage, deleting " + summary);
+        log(sender.getName() + " cleared the storage, deleting " + summary + ".");
         sender.sendMessage(ChatColor.GREEN + "Storage cleared. Deleted " + summary + ".");
         return true;
     }
