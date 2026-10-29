@@ -19,18 +19,38 @@ import java.util.UUID;
  */
 final class Storage {
 
+    /** Where and when items were looted. */
+    static final class Origin {
+        final String world;
+        final int x;
+        final int y;
+        final int z;
+        final long time;
+
+        Origin(String world, int x, int y, int z, long time) {
+            this.world = world;
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.time = time;
+        }
+    }
+
     /** Some amount of a group. Owned lots are reserved for their owner until reservedUntil. */
     static final class Lot {
         long amount;
         final UUID owner;
         final String ownerName;
         long reservedUntil;
+        /** The most recent loot that added to this lot. Its time drives expiry and the "Recent" sort. */
+        Origin last;
 
-        Lot(long amount, UUID owner, String ownerName, long reservedUntil) {
+        Lot(long amount, UUID owner, String ownerName, long reservedUntil, Origin last) {
             this.amount = amount;
             this.owner = owner;
             this.ownerName = ownerName;
             this.reservedUntil = reservedUntil;
+            this.last = last;
         }
 
         boolean reserved(long now) {
@@ -50,6 +70,8 @@ final class Storage {
         final Object stored;
         final int maxStack;
         final String bucket;
+        /** Lower-case name and type, for search. */
+        final String searchText;
         final List<Lot> lots = new ArrayList<Lot>();
 
         Group(ItemStack template, Object fingerprint, Object stored, int maxStack, String bucket) {
@@ -58,6 +80,18 @@ final class Storage {
             this.stored = stored;
             this.maxStack = maxStack;
             this.bucket = bucket;
+            this.searchText = (Tags.displayName(template, "") + " " + template.getType().name().replace('_', ' '))
+                    .toLowerCase(java.util.Locale.ROOT);
+        }
+
+        long lastLooted() {
+            long last = 0;
+            for (Lot lot : lots) {
+                if (lot.last != null) {
+                    last = Math.max(last, lot.last.time);
+                }
+            }
+            return last;
         }
 
         long total() {
@@ -84,6 +118,8 @@ final class Storage {
     private final Map<String, List<Group>> buckets = new HashMap<String, List<Group>>();
     /** Stored entries that couldn't be turned back into items (missing mod...). Kept as they are, never lost. */
     final List<Object> unreadable = new ArrayList<Object>();
+    /** Goes up on every change, so views can cache sorted lists. */
+    private long version;
 
     Storage(ItemCodec codec) {
         this.codec = codec;
@@ -102,8 +138,21 @@ final class Storage {
         return list != null && list.contains(group);
     }
 
-    int indexOf(Group group) {
-        return groups.indexOf(group);
+    long version() {
+        return version;
+    }
+
+    /** Items currently reserved for this player. */
+    long reservedFor(UUID owner, long now) {
+        long total = 0;
+        for (Group group : groups) {
+            for (Lot lot : group.lots) {
+                if (lot.reserved(now) && lot.owner.equals(owner)) {
+                    total += lot.amount;
+                }
+            }
+        }
+        return total;
     }
 
     long totalItems() {
@@ -158,7 +207,7 @@ final class Storage {
      * Adds a whole stack. Returns false, adding nothing, when the stack needs a new group and the
      * storage already holds maxGroups groups.
      */
-    boolean add(ItemStack stack, UUID owner, String ownerName, long reservedUntil, int maxGroups, long now) {
+    boolean add(ItemStack stack, UUID owner, String ownerName, long reservedUntil, int maxGroups, long now, Origin origin) {
         ItemStack one = stack.clone();
         one.setAmount(1);
         Object fingerprint = codec.fingerprint(one);
@@ -170,11 +219,12 @@ final class Storage {
             group = newGroup(one, fingerprint, codec.encode(one));
         }
         normalize(group, now);
-        addLot(group, stack.getAmount(), owner, ownerName, reservedUntil);
+        addLot(group, stack.getAmount(), owner, ownerName, reservedUntil, origin);
+        version++;
         return true;
     }
 
-    private static void addLot(Group group, long amount, UUID owner, String ownerName, long reservedUntil) {
+    private static void addLot(Group group, long amount, UUID owner, String ownerName, long reservedUntil, Origin origin) {
         if (owner == null || reservedUntil <= 0) {
             owner = null;
             ownerName = null;
@@ -184,24 +234,31 @@ final class Storage {
             if (Objects.equals(lot.owner, owner)) {
                 lot.amount += amount;
                 lot.reservedUntil = Math.max(lot.reservedUntil, reservedUntil);
+                if (origin != null && (lot.last == null || origin.time >= lot.last.time)) {
+                    lot.last = origin;
+                }
                 return;
             }
         }
-        group.lots.add(new Lot(amount, owner, ownerName, reservedUntil));
+        group.lots.add(new Lot(amount, owner, ownerName, reservedUntil, origin));
     }
 
     /** Folds lots whose reservation ran out into the group's shared lot. */
     void normalize(Group group, long now) {
         long expired = 0;
+        Origin latest = null;
         for (Iterator<Lot> it = group.lots.iterator(); it.hasNext(); ) {
             Lot lot = it.next();
             if (lot.owner != null && lot.reservedUntil <= now) {
                 expired += lot.amount;
+                if (lot.last != null && (latest == null || lot.last.time > latest.time)) {
+                    latest = lot.last;
+                }
                 it.remove();
             }
         }
         if (expired > 0) {
-            addLot(group, expired, null, null, 0);
+            addLot(group, expired, null, null, 0, latest);
         }
     }
 
@@ -245,13 +302,36 @@ final class Storage {
         if (group.lots.isEmpty()) {
             removeGroup(group);
         }
+        version++;
         return taken;
+    }
+
+    /** Deletes lots last looted before cutoff. Returns the number of items deleted. */
+    long expire(long cutoff) {
+        long removed = 0;
+        for (Group group : new ArrayList<Group>(groups)) {
+            for (Iterator<Lot> it = group.lots.iterator(); it.hasNext(); ) {
+                Lot lot = it.next();
+                if (lot.last != null && lot.last.time < cutoff) {
+                    removed += lot.amount;
+                    it.remove();
+                }
+            }
+            if (group.lots.isEmpty()) {
+                removeGroup(group);
+            }
+        }
+        if (removed > 0) {
+            version++;
+        }
+        return removed;
     }
 
     void clear() {
         groups.clear();
         buckets.clear();
         unreadable.clear();
+        version++;
     }
 
     // ------------------------------------------------------------------ persistence
@@ -270,6 +350,15 @@ final class Storage {
                     l.put("owner", lot.owner.toString());
                     l.put("owner-name", lot.ownerName);
                     l.put("reserved-until", lot.reservedUntil);
+                }
+                if (lot.last != null) {
+                    l.put("looted-at", lot.last.time);
+                    if (lot.last.world != null) {
+                        l.put("world", lot.last.world);
+                        l.put("x", lot.last.x);
+                        l.put("y", lot.last.y);
+                        l.put("z", lot.last.z);
+                    }
                 }
                 lots.add(l);
             }
@@ -309,7 +398,7 @@ final class Storage {
                 if (lots instanceof List) {
                     for (Object l : (List<?>) lots) {
                         if (l instanceof Map) {
-                            loadLot(group, (Map<?, ?>) l);
+                            loadLot(group, (Map<?, ?>) l, now);
                         }
                     }
                 }
@@ -328,7 +417,7 @@ final class Storage {
                     unreadable.add(o);
                 } else if (!(o instanceof ItemStack && stack.getType() == Material.AIR)) {
                     // Bukkit-format AIR entries from 0.1.0 were already lost when saved: skip them.
-                    add(stack, null, null, 0, Integer.MAX_VALUE, now);
+                    add(stack, null, null, 0, Integer.MAX_VALUE, now, new Origin(null, 0, 0, 0, now));
                 }
             }
         }
@@ -343,7 +432,7 @@ final class Storage {
         }
     }
 
-    private static void loadLot(Group group, Map<?, ?> l) {
+    private static void loadLot(Group group, Map<?, ?> l, long now) {
         Object amount = l.get("amount");
         if (!(amount instanceof Number) || ((Number) amount).longValue() <= 0) {
             return;
@@ -356,7 +445,16 @@ final class Storage {
         }
         Object until = l.get("reserved-until");
         Object name = l.get("owner-name");
+        // Lots saved before 0.4.0 have no loot time: count them as looted now, so expiry doesn't delete them at once.
+        Object time = l.get("looted-at");
+        Object world = l.get("world");
+        Origin origin = new Origin(world == null ? null : String.valueOf(world), intOf(l.get("x")), intOf(l.get("y")),
+                intOf(l.get("z")), time instanceof Number ? ((Number) time).longValue() : now);
         addLot(group, ((Number) amount).longValue(), owner, name == null ? null : String.valueOf(name),
-                until instanceof Number ? ((Number) until).longValue() : 0);
+                until instanceof Number ? ((Number) until).longValue() : 0, origin);
+    }
+
+    private static int intOf(Object o) {
+        return o instanceof Number ? ((Number) o).intValue() : 0;
     }
 }

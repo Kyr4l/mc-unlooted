@@ -9,7 +9,7 @@
 
     <properties>
         <!-- Base release version. CI overrides it with -Drevision=<next version>. -->
-        <revision>0.3.0</revision>
+        <revision>0.4.0</revision>
         <maven.compiler.source>1.8</maven.compiler.source>
         <maven.compiler.target>1.8</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -28,6 +28,12 @@
             <artifactId>bukkit</artifactId>
             <version>1.12.1-R0.1-SNAPSHOT</version>
             <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

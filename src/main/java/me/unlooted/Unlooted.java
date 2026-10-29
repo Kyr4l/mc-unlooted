@@ -11,10 +11,12 @@ import org.bukkit.configuration.InvalidConfigurationException;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Item;
+import org.bukkit.entity.Projectile;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityPickupItemEvent;
 import org.bukkit.event.entity.ItemDespawnEvent;
 import org.bukkit.event.entity.ItemMergeEvent;
@@ -22,8 +24,11 @@ import org.bukkit.event.entity.ItemSpawnEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryPickupItemEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
@@ -127,6 +132,8 @@ public class Unlooted extends JavaPlugin implements Listener {
         SETTINGS.put("loot-delay-seconds", "seconds, at least 1");
         SETTINGS.put("loot-interval-seconds", "seconds, at least 1");
         SETTINGS.put("owner-priority-seconds", "seconds, 0 to turn off");
+        SETTINGS.put("expire-after-days", "days, 0 to keep items forever");
+        SETTINGS.put("combat-block-seconds", "seconds, 0 to turn off");
         SETTINGS.put("max-pages", "whole number, 0 for unlimited");
         SETTINGS.put("excluded-worlds", "comma-separated world names, or none");
         SETTINGS.put("excluded-items", "comma-separated item names, * as wildcard, or none");
@@ -141,9 +148,15 @@ public class Unlooted extends JavaPlugin implements Listener {
     private ItemCodec codec;
     private Storage storage;
     private Menu menu;
+    private final Messages messages = new Messages();
+    private TakeLog takeLog;
+    /** When each player's PvP combat tag runs out. */
+    private final Map<UUID, Long> combatUntil = new HashMap<UUID, Long>();
 
     private long delayMs;
     private long priorityMs;
+    private long expireMs;
+    private long combatMs;
     private long intervalTicks;
     private BukkitTask sweepTask;
     private int maxGroups;
@@ -168,7 +181,9 @@ public class Unlooted extends JavaPlugin implements Listener {
     public void onEnable() {
         saveDefaultConfig();
         dataFile = new File(getDataFolder(), "data.yml");
+        Tags.init(this);
         codec = new ItemCodec(getLogger());
+        takeLog = new TakeLog(this);
         storage = new Storage(codec);
         menu = new Menu(this, storage);
 
@@ -181,9 +196,11 @@ public class Unlooted extends JavaPlugin implements Listener {
         getServer().getPluginManager().registerEvents(menu, this);
 
         applyConfig();
+        checkTagging();
         // Saves only when something changed, at most every 30 seconds, plus every 5 minutes for the timers.
         getServer().getScheduler().runTaskTimer(this, () -> {
             saveTicks++;
+            expireOld();
             if (dirty || saveTicks % 10 == 0) {
                 save(false);
             }
@@ -191,10 +208,26 @@ public class Unlooted extends JavaPlugin implements Listener {
         getServer().getScheduler().runTaskTimer(this, menu::guard, 1L, 1L);
     }
 
+    /**
+     * Menu items must stay recognisable after the server stores them, or the guard could mistake them
+     * for real items. Checked once at startup by putting a pane into an inventory and reading it back.
+     */
+    private void checkTagging() {
+        Inventory probe = Bukkit.createInventory(null, 9);
+        probe.setItem(0, Tags.pane("BLACK", 15, "probe", "probe"));
+        if (!Tags.isTagged(probe.getItem(0))) {
+            getLogger().severe("Menu items can't be tagged on this server. Copies of menu icons are still blocked"
+                    + " while the storage is open, but please report this with your server version.");
+        }
+    }
+
     /** Reads config.yml values into fields and (re)starts the global loot timer if its interval changed. */
     private void applyConfig() {
+        messages.load(getConfig().getConfigurationSection("messages"));
         delayMs = Math.max(1, getConfig().getLong("loot-delay-seconds", 300)) * 1000L;
         priorityMs = Math.max(0, getConfig().getLong("owner-priority-seconds", 600)) * 1000L;
+        expireMs = Math.max(0, getConfig().getLong("expire-after-days", 0)) * 24L * 60 * 60 * 1000;
+        combatMs = Math.max(0, getConfig().getLong("combat-block-seconds", 10)) * 1000L;
         int maxPages = Math.max(0, getConfig().getInt("max-pages", 0));
         maxGroups = maxPages == 0 ? Integer.MAX_VALUE : (int) Math.min(Integer.MAX_VALUE, (long) maxPages * Menu.PER_PAGE);
         ignoreUnpickupable = getConfig().getBoolean("ignore-unpickupable-items", true);
@@ -251,10 +284,35 @@ public class Unlooted extends JavaPlugin implements Listener {
         if (storage != null) {
             save(true);
         }
+        if (takeLog != null) {
+            takeLog.flush();
+        }
     }
 
     void markDirty() {
         dirty = true;
+    }
+
+    Messages messages() {
+        return messages;
+    }
+
+    void log(String entry) {
+        takeLog.add(entry);
+    }
+
+    /** Deletes stored items older than expire-after-days, when it is set. */
+    private void expireOld() {
+        if (expireMs <= 0) {
+            return;
+        }
+        long removed = storage.expire(System.currentTimeMillis() - expireMs);
+        if (removed > 0) {
+            markDirty();
+            menu.refreshAll();
+            getLogger().info("Deleted " + removed + " stored item(s) older than the expire-after-days setting.");
+            log("Expiry deleted " + removed + " item(s)");
+        }
     }
 
     // ------------------------------------------------------------------ per-item timers and owners
@@ -462,6 +520,7 @@ public class Unlooted extends JavaPlugin implements Listener {
     private int loot(List<Item> due, long now) {
         int count = 0;
         int stacks = 0;
+        Map<UUID, Long> reservedPerOwner = new HashMap<UUID, Long>();
         for (Item item : due) {
             ItemStack stack = item.getItemStack();
             UUID id = item.getUniqueId();
@@ -472,11 +531,17 @@ public class Unlooted extends JavaPlugin implements Listener {
                 continue;
             }
             Owner owner = priorityMs > 0 ? owners.get(id) : null;
+            Location at = item.getLocation();
+            Storage.Origin origin = new Storage.Origin(at.getWorld().getName(), at.getBlockX(), at.getBlockY(), at.getBlockZ(), now);
             boolean stored = storage.add(stack.clone(), owner == null ? null : owner.id, owner == null ? null : owner.name,
-                    owner == null ? 0 : now + priorityMs, maxGroups, now);
+                    owner == null ? 0 : now + priorityMs, maxGroups, now, origin);
             if (stored) {
                 count += stack.getAmount();
                 stacks++;
+                if (owner != null) {
+                    Long before = reservedPerOwner.get(owner.id);
+                    reservedPerOwner.put(owner.id, (before == null ? 0 : before) + stack.getAmount());
+                }
                 timers.remove(id);
                 owners.remove(id);
                 item.remove();
@@ -489,6 +554,13 @@ public class Unlooted extends JavaPlugin implements Listener {
             Bukkit.broadcastMessage(ChatColor.translateAlternateColorCodes('&', broadcastMessage
                     .replace("{count}", String.valueOf(count))
                     .replace("{stacks}", String.valueOf(stacks))));
+            for (Map.Entry<UUID, Long> entry : reservedPerOwner.entrySet()) {
+                Player owner = Bukkit.getPlayer(entry.getKey());
+                if (owner != null) {
+                    owner.sendMessage(messages.get("owner-looted", "count", Menu.number(entry.getValue()),
+                            "time", Menu.duration(priorityMs)));
+                }
+            }
         }
         return count;
     }
@@ -507,6 +579,10 @@ public class Unlooted extends JavaPlugin implements Listener {
                 return reload(sender);
             case "config":
                 return configCommand(sender, label, args);
+            case "search":
+                return searchCommand(sender, label, args);
+            case "log":
+                return logCommand(sender, args);
             default:
                 return openStorage(sender, label, args);
         }
@@ -514,40 +590,142 @@ public class Unlooted extends JavaPlugin implements Listener {
 
     private boolean openStorage(CommandSender sender, String label, String[] args) {
         if (!(sender instanceof Player)) {
-            sender.sendMessage("Only players can open the storage.");
+            sender.sendMessage(messages.get("players-only"));
             return true;
         }
         Player p = (Player) sender;
         if (!p.hasPermission("unlooted.use")) {
-            p.sendMessage(ChatColor.RED + "You don't have permission.");
+            p.sendMessage(messages.get("no-permission"));
+            return true;
+        }
+        if (inCombat(p)) {
+            p.sendMessage(messages.get("in-combat"));
             return true;
         }
         if (storage.isEmpty()) {
-            p.sendMessage(ChatColor.YELLOW + "There are no auto-looted items right now.");
+            p.sendMessage(messages.get("no-items"));
             return true;
         }
-        int pages = Menu.listPages(storage.groups().size());
+        int pages = Menu.listPages(menu.listFor(p.getUniqueId()).size());
         int page = 1;
         if (args.length > 0) {
             try {
                 page = Integer.parseInt(args[0]);
             } catch (NumberFormatException ex) {
-                p.sendMessage(ChatColor.RED + "Usage: /" + label + " [page]");
+                p.sendMessage(messages.get("usage-page", "label", label));
                 return true;
             }
         }
         if (page < 1 || page > pages) {
-            p.sendMessage(ChatColor.RED + "Page must be between 1 and " + pages + ".");
+            p.sendMessage(messages.get("page-range", "pages", pages));
             return true;
         }
         menu.openList(p, page - 1);
         return true;
     }
 
+    /** /unlooted search [text]: opens the item list showing only matching items. No text clears the search. */
+    private boolean searchCommand(CommandSender sender, String label, String[] args) {
+        if (!(sender instanceof Player)) {
+            sender.sendMessage(messages.get("players-only"));
+            return true;
+        }
+        Player p = (Player) sender;
+        if (!p.hasPermission("unlooted.use")) {
+            p.sendMessage(messages.get("no-permission"));
+            return true;
+        }
+        if (inCombat(p)) {
+            p.sendMessage(messages.get("in-combat"));
+            return true;
+        }
+        if (storage.isEmpty()) {
+            p.sendMessage(messages.get("no-items"));
+            return true;
+        }
+        String query = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
+        if (menu.search(p, query) == 0) {
+            p.sendMessage(messages.get("search-none", "query", query));
+            menu.search(p, null);
+            return true;
+        }
+        menu.openList(p, 0);
+        return true;
+    }
+
+    /** /unlooted log [name]: the latest takes, optionally only those mentioning a player. */
+    private boolean logCommand(CommandSender sender, String[] args) {
+        if (!sender.hasPermission("unlooted.admin")) {
+            sender.sendMessage(messages.get("no-permission"));
+            return true;
+        }
+        String filter = args.length > 1 ? args[1] : null;
+        List<String> lines = takeLog.latest(filter, 15);
+        if (lines.isEmpty()) {
+            sender.sendMessage(ChatColor.YELLOW + "No matching entries since the last restart. Older ones are in takes.log.");
+            return true;
+        }
+        sender.sendMessage(ChatColor.YELLOW + "Latest takes, newest first. The full history is in plugins/Unlooted/takes.log.");
+        for (String line : lines) {
+            sender.sendMessage(ChatColor.GRAY + line);
+        }
+        return true;
+    }
+
+    // ------------------------------------------------------------------ combat and joins
+
+    private boolean inCombat(Player player) {
+        Long until = combatUntil.get(player.getUniqueId());
+        return combatMs > 0 && until != null && until > System.currentTimeMillis();
+    }
+
+    /** Player-versus-player hits tag both players for combat-block-seconds, and close the victim's storage. */
+    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+    public void onPvp(EntityDamageByEntityEvent e) {
+        if (combatMs <= 0 || !(e.getEntity() instanceof Player)) {
+            return;
+        }
+        Entity damager = e.getDamager();
+        if (damager instanceof Projectile && ((Projectile) damager).getShooter() instanceof Entity) {
+            damager = (Entity) ((Projectile) damager).getShooter();
+        }
+        if (!(damager instanceof Player) || damager.equals(e.getEntity())) {
+            return;
+        }
+        long until = System.currentTimeMillis() + combatMs;
+        for (Player player : new Player[] {(Player) e.getEntity(), (Player) damager}) {
+            combatUntil.put(player.getUniqueId(), until);
+            if (menu.isViewing(player)) {
+                player.closeInventory();
+                player.sendMessage(messages.get("in-combat"));
+            }
+        }
+    }
+
+    /** Tells players who log in about items reserved for them. */
+    @EventHandler
+    public void onJoin(PlayerJoinEvent e) {
+        final Player player = e.getPlayer();
+        getServer().getScheduler().runTaskLater(this, () -> {
+            if (!player.isOnline()) {
+                return;
+            }
+            long reserved = storage.reservedFor(player.getUniqueId(), System.currentTimeMillis());
+            if (reserved > 0) {
+                player.sendMessage(messages.get("owner-join", "count", Menu.number(reserved)));
+            }
+        }, 40L);
+    }
+
+    @EventHandler
+    public void onQuit(PlayerQuitEvent e) {
+        combatUntil.remove(e.getPlayer().getUniqueId());
+    }
+
     /** /unlooted loot [all]: runs the global loot sweep now. "all" also ignores the per-item timers. */
     private boolean forceLoot(CommandSender sender, String label, String[] args) {
         if (!sender.hasPermission("unlooted.loot")) {
-            sender.sendMessage(ChatColor.RED + "You don't have permission.");
+            sender.sendMessage(messages.get("no-permission"));
             return true;
         }
         boolean all = args.length > 1 && args[1].equalsIgnoreCase("all");
@@ -566,7 +744,7 @@ public class Unlooted extends JavaPlugin implements Listener {
     /** /unlooted clear [confirm]: permanently deletes everything in the storage. */
     private boolean clear(CommandSender sender, String label, String[] args) {
         if (!sender.hasPermission("unlooted.admin")) {
-            sender.sendMessage(ChatColor.RED + "You don't have permission.");
+            sender.sendMessage(messages.get("no-permission"));
             return true;
         }
         long now = System.currentTimeMillis();
@@ -593,6 +771,7 @@ public class Unlooted extends JavaPlugin implements Listener {
         storage.clear();
         save(false);
         getLogger().info(sender.getName() + " cleared the storage, deleting " + summary + ".");
+        log(sender.getName() + " cleared the storage, deleting " + summary);
         sender.sendMessage(ChatColor.GREEN + "Storage cleared. Deleted " + summary + ".");
         return true;
     }
@@ -600,7 +779,7 @@ public class Unlooted extends JavaPlugin implements Listener {
     /** /unlooted reload: re-reads config.yml from disk. */
     private boolean reload(CommandSender sender) {
         if (!sender.hasPermission("unlooted.admin")) {
-            sender.sendMessage(ChatColor.RED + "You don't have permission.");
+            sender.sendMessage(messages.get("no-permission"));
             return true;
         }
         reloadConfig();
@@ -612,7 +791,7 @@ public class Unlooted extends JavaPlugin implements Listener {
     /** /unlooted config [key] [value]: lists, shows or changes a setting and saves it to config.yml. */
     private boolean configCommand(CommandSender sender, String label, String[] args) {
         if (!sender.hasPermission("unlooted.admin")) {
-            sender.sendMessage(ChatColor.RED + "You don't have permission.");
+            sender.sendMessage(messages.get("no-permission"));
             return true;
         }
         if (args.length == 1) {
@@ -641,9 +820,11 @@ public class Unlooted extends JavaPlugin implements Listener {
                 case "loot-delay-seconds":
                 case "loot-interval-seconds":
                 case "owner-priority-seconds":
+                case "expire-after-days":
+                case "combat-block-seconds":
                 case "max-pages":
                     long number = Long.parseLong(raw);
-                    long min = key.equals("max-pages") || key.equals("owner-priority-seconds") ? 0 : 1;
+                    long min = key.startsWith("loot-") ? 1 : 0;
                     if (number < min || number > Integer.MAX_VALUE) {
                         throw new NumberFormatException();
                     }
@@ -740,7 +921,10 @@ public class Unlooted extends JavaPlugin implements Listener {
             if ("loot".startsWith(typed) && sender.hasPermission("unlooted.loot")) {
                 out.add("loot");
             }
-            for (String sub : new String[] {"clear", "reload", "config"}) {
+            if ("search".startsWith(typed) && sender.hasPermission("unlooted.use")) {
+                out.add("search");
+            }
+            for (String sub : new String[] {"clear", "reload", "config", "log"}) {
                 if (sub.startsWith(typed) && admin) {
                     out.add(sub);
                 }

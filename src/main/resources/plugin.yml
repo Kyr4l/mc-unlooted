@@ -7,7 +7,7 @@ commands:
   unlooted:
     description: Open the shared storage of auto-looted items.
     aliases: [ul, unlootedbin]
-    usage: /<command> [page] | loot [all] | clear | reload | config [key] [value]
+    usage: /<command> [page] | search [text] | loot [all] | clear | log [name] | reload | config [key] [value]
 permissions:
   unlooted.use:
     description: Open the shared inventory
@@ -16,5 +16,5 @@ permissions:
     description: Force the auto-loot sweep to run immediately
     default: op
   unlooted.admin:
-    description: Clear the storage, change the config, and take reserved items
+    description: Clear the storage, view the take log, change the config, and take reserved items
     default: op

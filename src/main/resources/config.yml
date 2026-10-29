@@ -16,6 +16,13 @@ owner-priority-seconds: 600
 # entry stay on the ground. More of an item already in storage always fits.
 max-pages: 0
 
+# Delete stored items that were looted more than this many days ago. 0 = keep forever.
+expire-after-days: 0
+
+# Players can't open the storage for this many seconds after hitting or being hit by
+# another player, and an open storage closes when they're hit. 0 = off.
+combat-block-seconds: 10
+
 # Worlds where dropped items are never looted, for example a creative world.
 excluded-worlds: []
 
@@ -29,3 +36,50 @@ ignore-unpickupable-items: true
 # Broadcast after a sweep that looted at least one item.
 # {count} = total number of items, {stacks} = number of dropped stacks looted.
 broadcast-message: "&e[Unlooted] &f{count} &eitem(s) were auto-looted. Type &f/unlooted &eto claim them."
+
+# Every text players see. & color codes work, and {words} in braces are filled in by the plugin.
+# Delete a line to get the default back. Run /unlooted reload after editing.
+messages:
+  # Chat
+  no-permission: "&cYou don't have permission."
+  players-only: "Only players can open the storage."
+  no-items: "&eThere are no auto-looted items right now."
+  storage-empty-now: "&eThe storage is empty now."
+  usage-page: "&cUsage: /{label} [page]"
+  page-range: "&cPage must be between 1 and {pages}."
+  inventory-full: "&cYour inventory is full."
+  reserved-stack: "&cThat stack is reserved for its owner."
+  reserved-items: "&cThose items are reserved for their owner."
+  owner-looted: "&e[Unlooted] &f{count} &eof your items were looted. They're reserved for you for &f{time}&e. Type &f/ul &eto claim them."
+  owner-join: "&e[Unlooted] You have &f{count} &ereserved items waiting. Type &f/ul &eto claim them."
+  search-none: "&eNo stored items match &f{query}&e."
+  in-combat: "&cYou can't open the storage while in combat."
+  # Menu
+  title: "Unlooted Items"
+  unknown-item: "Unknown item"
+  available: "&eAvailable: &f{amount}"
+  reserved-owners: "&cReserved for owners: &f{amount}"
+  hint-choose: "&7Left: choose a stack"
+  hint-take-stack: "&7Shift-left: take a stack"
+  hint-take: "&7Left: take"
+  hint-half: "&7Right: take half"
+  hint-fill: "&7Shift-right: fill inventory"
+  reserved-you: "&aReserved for you"
+  reserved-for: "&cReserved for {owner}, {time} left"
+  found-at: "&8Found in {world} at {x}, {y}, {z}"
+  bar-page: "&7Page {page}/{pages}"
+  bar-lore: "&8Navigation bar, not lootable"
+  prev: "&c« Previous page"
+  next: "&aNext page »"
+  goto-lore: "&7Go to page {page}/{pages}"
+  back: "&eBack to all items"
+  back-lore: "&7Return to the item list"
+  sort: "&bSort: {mode}"
+  sort-lore: "&7Click to change"
+  sort-recent: "Recent"
+  sort-name: "Name"
+  sort-amount: "Amount"
+  search: "&bSearch"
+  search-lore: "&7Type /ul search <text>"
+  search-active: "&bSearch: {query}"
+  search-active-lore: "&7Click to clear"
