@@ -423,6 +423,29 @@ final class Storage {
         return removed;
     }
 
+    /** Deletes every item kind the filter accepts, with all its stacks. Returns the number of items deleted. */
+    long removeIf(java.util.function.Predicate<Group> filter) {
+        long removed = 0;
+        for (Group group : new ArrayList<Group>(groups)) {
+            if (!filter.test(group)) {
+                continue;
+            }
+            for (Lot lot : group.lots) {
+                removed += lot.amount;
+                indexRemove(lot);
+            }
+            group.lots.clear();
+            removeGroup(group);
+            if (listener != null) {
+                listener.removed(group);
+            }
+        }
+        if (removed > 0) {
+            version++;
+        }
+        return removed;
+    }
+
     void clear() {
         groups.clear();
         buckets.clear();

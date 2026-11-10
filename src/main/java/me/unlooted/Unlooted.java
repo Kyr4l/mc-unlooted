@@ -296,6 +296,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             menu.closeAll();
         }
         long now = System.currentTimeMillis();
+        dropGoneTimers();
         for (Timer t : timers.values()) {
             t.advance(now);
             t.paused = true;
@@ -870,6 +871,9 @@ public class Unlooted extends JavaPlugin implements Listener {
             sender.sendMessage(messages.get("no-permission"));
             return true;
         }
+        if (args.length > 1 && !args[1].equalsIgnoreCase("confirm")) {
+            return clearItems(sender, label, args);
+        }
         long now = System.currentTimeMillis();
         int entries = storage.groups().size() + storage.unreadable.size();
         String summary = Menu.number(storage.totalItems()) + " item(s) of " + storage.groups().size() + " kind(s)"
@@ -895,6 +899,64 @@ public class Unlooted extends JavaPlugin implements Listener {
         save(false);
         log(sender.getName() + " cleared the storage, deleting " + summary + ".");
         sender.sendMessage(ChatColor.GREEN + "Storage cleared. Deleted " + summary + ".");
+        return true;
+    }
+
+    /**
+     * /unlooted clear &lt;item&gt; [confirm]: deletes one kind of item from the storage. The item is a Bukkit
+     * material name like the ones in excluded-items (several can be separated by commas, * is a wildcard).
+     */
+    private boolean clearItems(CommandSender sender, String label, String[] args) {
+        List<Pattern> patterns = new ArrayList<Pattern>();
+        for (String part : args[1].split(",")) {
+            if (!part.trim().isEmpty()) {
+                patterns.add(glob(part));
+            }
+        }
+        if (patterns.isEmpty()) {
+            sender.sendMessage(ChatColor.RED + "Usage: /" + label + " clear <item> [confirm]");
+            return true;
+        }
+        final List<Pattern> match = patterns;
+        java.util.function.Predicate<Storage.Group> filter = group -> {
+            String type = group.template.getType().name();
+            for (Pattern pattern : match) {
+                if (pattern.matcher(type).matches()) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        long items = 0;
+        int kinds = 0;
+        for (Storage.Group group : storage.groups()) {
+            if (filter.test(group)) {
+                kinds++;
+                items += group.total();
+            }
+        }
+        if (kinds == 0) {
+            sender.sendMessage(ChatColor.YELLOW + "No stored items match " + args[1] + ". Use the Bukkit item names, like in excluded-items.");
+            return true;
+        }
+
+        long now = System.currentTimeMillis();
+        String summary = Menu.number(items) + " item(s) of " + kinds + " kind(s) matching " + args[1];
+        String key = sender.getName() + "|" + args[1].toLowerCase(Locale.ROOT);
+        Long asked = pendingClears.get(key);
+        if (args.length < 3 || !args[2].equalsIgnoreCase("confirm") || asked == null || now - asked > CLEAR_CONFIRM_MS) {
+            pendingClears.put(key, now);
+            sender.sendMessage(ChatColor.RED + "This permanently deletes " + summary + ".");
+            sender.sendMessage(ChatColor.RED + "Type /" + label + " clear " + args[1] + " confirm within 30 seconds to do it.");
+            return true;
+        }
+
+        pendingClears.remove(key);
+        menu.closeAll();
+        storage.removeIf(filter);
+        save(false);
+        log(sender.getName() + " deleted " + summary + " from the storage.");
+        sender.sendMessage(ChatColor.GREEN + "Deleted " + summary + ".");
         return true;
     }
 
@@ -1060,8 +1122,16 @@ public class Unlooted extends JavaPlugin implements Listener {
             String typed = args[1].toLowerCase(Locale.ROOT);
             if (args[0].equalsIgnoreCase("loot") && "all".startsWith(typed)) {
                 out.add("all");
-            } else if (args[0].equalsIgnoreCase("clear") && admin && "confirm".startsWith(typed)) {
-                out.add("confirm");
+            } else if (args[0].equalsIgnoreCase("clear") && admin) {
+                if ("confirm".startsWith(typed)) {
+                    out.add("confirm");
+                }
+                for (Storage.Group group : storage.groups()) {
+                    String type = group.template.getType().name();
+                    if (type.toLowerCase(Locale.ROOT).startsWith(typed) && !out.contains(type)) {
+                        out.add(type);
+                    }
+                }
             } else if (args[0].equalsIgnoreCase("config") && admin) {
                 for (String key : SETTINGS.keySet()) {
                     if (key.startsWith(typed)) {
@@ -1103,9 +1173,17 @@ public class Unlooted extends JavaPlugin implements Listener {
         root.put("format", 2);
         root.put("groups", storage.snapshot());
         long now = System.currentTimeMillis();
+        // Only timers that are worth keeping across a restart are written. An item without a saved timer
+        // just starts waiting again, so dropping the young ones costs at most half the delay, while a busy
+        // farm that machines empty all day would otherwise fill the file with thousands of dead timers.
+        dropGoneTimers();
+        long keepFrom = delayMs / 2;
         Map<String, Object> timerData = new LinkedHashMap<String, Object>();
         for (Map.Entry<UUID, Timer> entry : timers.entrySet()) {
-            timerData.put(entry.getKey().toString(), entry.getValue().current(now));
+            long age = entry.getValue().current(now);
+            if (age >= keepFrom) {
+                timerData.put(entry.getKey().toString(), age);
+            }
         }
         root.put("timers", timerData);
         Map<String, Object> ownerData = new LinkedHashMap<String, Object>();
@@ -1124,6 +1202,19 @@ public class Unlooted extends JavaPlugin implements Listener {
             write(seq, dump(root));
         } else {
             getServer().getScheduler().runTaskAsynchronously(this, () -> write(seq, dump(root)));
+        }
+    }
+
+    /**
+     * Forgets the timers of items in loaded chunks that no longer exist, such as items a machine took.
+     * Items in unloaded chunks keep their (paused) timer, since they still exist. Main thread only.
+     */
+    private void dropGoneTimers() {
+        for (Iterator<Map.Entry<UUID, Timer>> it = timers.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<UUID, Timer> entry = it.next();
+            if (!entry.getValue().paused && Bukkit.getEntity(entry.getKey()) == null) {
+                it.remove();
+            }
         }
     }
 

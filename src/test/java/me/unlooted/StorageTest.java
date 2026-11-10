@@ -150,6 +150,22 @@ public class StorageTest {
     }
 
     @Test
+    public void removeIfDeletesOnlyMatchingKindsAndTheirOwnerIndex() {
+        add(Material.COBBLESTONE, 64, ALICE, NOW + 10_000);
+        add(Material.COBBLESTONE, 30, null, 0);
+        add(Material.DIRT, 7, null, 0);
+        assertEquals(64, storage.reservedFor(ALICE, NOW));
+
+        long removed = storage.removeIf(g -> g.template.getType() == Material.COBBLESTONE);
+
+        assertEquals(94, removed);
+        assertEquals(1, storage.groups().size());
+        assertEquals(7, storage.totalItems());
+        assertEquals(0, storage.reservedFor(ALICE, NOW));
+        assertEquals(0, storage.removeIf(g -> g.template.getType() == Material.COBBLESTONE));
+    }
+
+    @Test
     public void latestOriginIsKept() {
         storage.add(new ItemStack(Material.STONE, 5), null, null, 0, Integer.MAX_VALUE, NOW, new Storage.Origin("a", 1, 2, 3, NOW));
         storage.add(new ItemStack(Material.STONE, 5), null, null, 0, Integer.MAX_VALUE, NOW, new Storage.Origin("b", 4, 5, 6, NOW + 1));

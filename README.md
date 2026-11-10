@@ -29,6 +29,7 @@ Bukkit plugin for Minecraft 1.12.1 that collects items left lying on the ground 
 | `/unlooted loot` | `unlooted.loot` (default: op) | Run the global loot sweep now. Loots items whose own timer already reached the delay |
 | `/unlooted loot all` | `unlooted.loot` (default: op) | Loot every item on the ground right now, ignoring the per-item timers |
 | `/unlooted clear` | `unlooted.admin` (default: op) | Permanently delete everything in the storage. Asks for `/unlooted clear confirm` within 30 seconds first |
+| `/unlooted clear <item>` | `unlooted.admin` (default: op) | Permanently delete one kind of item from the storage, for example `/unlooted clear COBBLESTONE`. Takes Bukkit item names like `excluded-items`, with `*` as wildcard and commas for several. Shows how many items match and asks for `/unlooted clear <item> confirm` within 30 seconds first |
 | `/unlooted log [name]` | `unlooted.admin` (default: op) | Show the latest takes, optionally only those mentioning a player |
 | `/unlooted reload` | `unlooted.admin` (default: op) | Reload `config.yml` from disk after editing it |
 | `/unlooted config` | `unlooted.admin` (default: op) | List all settings and their current values |
@@ -68,7 +69,7 @@ After a plugin update, `config.yml` updates itself on the next start. New settin
 | `broadcast-message` | see file | Supports `{count}` and `{stacks}` placeholders and `&` color codes |
 | `messages` | see file | Every text players see. Edit and run `/unlooted reload` |
 
-Stored items and timers are saved to `plugins/Unlooted/data.yml`.
+Stored items and timers are saved to `plugins/Unlooted/data.yml`. Only timers of items that already waited half of `loot-delay-seconds` are saved, and timers of items that no longer exist are dropped, so the file stays small next to farms that machines empty. After a restart, an item that waited less than half the delay starts waiting again.
 
 ## Item data is kept intact
 
