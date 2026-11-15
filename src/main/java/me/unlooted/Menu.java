@@ -59,6 +59,7 @@ final class Menu implements Listener {
 
     /** A player's open menu: which page of which list, what each slot does, and what was placed where. */
     private static final class View implements InventoryHolder {
+        Player viewer;
         Inventory inventory;
         String title;
         /** Null for the item list, else the item whose stacks are shown. */
@@ -89,6 +90,15 @@ final class Menu implements Listener {
     private final Map<UUID, SortedGroups.Mode> sorts = new HashMap<UUID, SortedGroups.Mode>();
     private final Map<UUID, String> searches = new HashMap<UUID, String>();
     private final SortedGroups sorted;
+    /**
+     * Who has the menu open, so nothing needs to ask an open inventory for its holder: for a chest or a
+     * modded machine that copies the whole block, and it would happen every tick and on every click.
+     */
+    private final Map<UUID, View> viewers = new HashMap<UUID, View>();
+    /** Set while the plugin opens a menu, so the open event can tell it from other containers. */
+    private boolean opening;
+    /** Storage changes of a tick are drawn together, once, on the next one. */
+    private boolean refreshPending;
     private int tick;
 
     Menu(Unlooted plugin, Storage storage) {
@@ -107,13 +117,33 @@ final class Menu implements Listener {
         return plugin.messages();
     }
 
-    private static View viewOf(Inventory inventory) {
-        InventoryHolder holder = inventory == null ? null : inventory.getHolder();
-        return holder instanceof View ? (View) holder : null;
+    /** The player's menu when top, their open top inventory, is it. Only players known to view a menu are checked further. */
+    private View viewFor(HumanEntity player, Inventory top) {
+        View view = viewers.get(player.getUniqueId());
+        if (view == null) {
+            return null;
+        }
+        if (top == view.inventory) {
+            return view;
+        }
+        // Some servers hand out a wrapper of the inventory: ask it, the only time a holder is needed.
+        if (top != null && top.getSize() == view.inventory.getSize() && top.getHolder() == view) {
+            return view;
+        }
+        return null;
     }
 
-    private static View openView(HumanEntity player) {
-        return viewOf(player.getOpenInventory().getTopInventory());
+    private View openView(HumanEntity player) {
+        View view = viewFor(player, player.getOpenInventory().getTopInventory());
+        if (view == null) {
+            viewers.remove(player.getUniqueId());
+        }
+        return view;
+    }
+
+    /** The open menus, safe to iterate while menus open and close. */
+    private View[] openViews() {
+        return viewers.values().toArray(new View[0]);
     }
 
     static int listPages(int groups) {
@@ -196,7 +226,7 @@ final class Menu implements Listener {
                     break;
                 }
             }
-            name = Tags.displayName(group.template, msg().get("unknown-item"));
+            name = group.name(msg().get("unknown-item"));
         }
 
         int size = (Math.max(1, (icons.size() + 8) / 9) + 1) * 9;
@@ -248,9 +278,17 @@ final class Menu implements Listener {
             }
         }
         view.playerPrints = prints(player.getInventory());
+        view.viewer = player;
         if (!reuse) {
-            player.openInventory(inventory);
+            opening = true;
+            try {
+                player.openInventory(inventory);
+            } finally {
+                opening = false;
+            }
         }
+        // After opening: closing the previous menu forgets that one.
+        viewers.put(viewer, view);
     }
 
     private ItemStack groupIcon(Storage.Group group, UUID viewer, boolean bypass, long now) {
@@ -275,7 +313,7 @@ final class Menu implements Listener {
         } else if (group.stacks() > 1) {
             lines.add(msg().get("hint-choose"));
         }
-        return Tags.icon(group.template, 1, lines, Tags.displayName(group.template, msg().get("unknown-item")));
+        return Tags.icon(group.template, 1, lines, group.name(msg().get("unknown-item")));
     }
 
     private ItemStack stackIcon(Storage.Group group, Storage.Lot lot, long amount, UUID viewer, boolean bypass, long now) {
@@ -296,7 +334,7 @@ final class Menu implements Listener {
         if (lines.isEmpty()) {
             lines.add(msg().get("hint-take"));
         }
-        return Tags.icon(group.template, (int) amount, lines, Tags.displayName(group.template, msg().get("unknown-item")));
+        return Tags.icon(group.template, (int) amount, lines, group.name(msg().get("unknown-item")));
     }
 
     private ItemStack[] navigationBar(UUID viewer, int page, int pages, boolean stackList) {
@@ -324,9 +362,14 @@ final class Menu implements Listener {
         return bar;
     }
 
-    /** Re-draws every open menu after the storage changed. */
+    /** Re-draws every open menu after the storage changed, on the next tick, once however many changes came. */
     void refreshAll() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
+        refreshPending = true;
+    }
+
+    private void refreshNow() {
+        for (View open : openViews()) {
+            Player player = open.viewer;
             View view = openView(player);
             if (view == null) {
                 continue;
@@ -343,11 +386,12 @@ final class Menu implements Listener {
     }
 
     void closeAll() {
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            if (openView(player) != null) {
-                player.closeInventory();
+        for (View view : openViews()) {
+            if (openView(view.viewer) != null) {
+                view.viewer.closeInventory();
             }
         }
+        viewers.clear();
     }
 
     boolean isViewing(Player player) {
@@ -359,7 +403,7 @@ final class Menu implements Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     public void onClick(InventoryClickEvent e) {
         Inventory top = e.getView().getTopInventory();
-        View view = viewOf(top);
+        View view = viewFor(e.getWhoClicked(), top);
         if (view == null) {
             // Outside the menu: a menu item that escaped somehow is removed the moment it is touched.
             // This also covers creative mode, where the client says which item to put in a slot.
@@ -550,7 +594,7 @@ final class Menu implements Listener {
             return;
         }
         StringBuilder line = new StringBuilder(player.getName()).append(" took ").append(taken).append(' ')
-                .append(Tags.displayName(group.template, "unknown item"));
+                .append(group.name("unknown item"));
         if (!(sources.size() == 1 && sources.containsKey("shared"))) {
             List<String> parts = new ArrayList<String>();
             for (Map.Entry<String, Long> entry : sources.entrySet()) {
@@ -573,7 +617,7 @@ final class Menu implements Listener {
     @EventHandler(priority = EventPriority.LOWEST)
     public void onDrag(InventoryDragEvent e) {
         Inventory top = e.getView().getTopInventory();
-        if (viewOf(top) == null) {
+        if (viewFor(e.getWhoClicked(), top) == null) {
             return;
         }
         for (int raw : e.getRawSlots()) {
@@ -595,7 +639,16 @@ final class Menu implements Listener {
      */
     void guard() {
         tick++;
-        for (Player player : Bukkit.getOnlinePlayers()) {
+        if (viewers.isEmpty()) {
+            refreshPending = false;
+            return;
+        }
+        if (refreshPending) {
+            refreshPending = false;
+            refreshNow();
+        }
+        for (View open : openViews()) {
+            Player player = open.viewer;
             View view = openView(player);
             if (view == null) {
                 continue;
@@ -723,7 +776,10 @@ final class Menu implements Listener {
     @EventHandler
     public void onClose(InventoryCloseEvent e) {
         final HumanEntity player = e.getPlayer();
-        final View view = viewOf(e.getInventory());
+        final View view = viewFor(player, e.getInventory());
+        if (view != null) {
+            viewers.remove(player.getUniqueId());
+        }
         if (view == null) {
             // Closing any other container: clear out menu items that might have been smuggled into it.
             Tags.purge(e.getInventory(), SCAN_LIMIT);
@@ -743,7 +799,7 @@ final class Menu implements Listener {
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onOpen(InventoryOpenEvent e) {
-        if (viewOf(e.getInventory()) == null) {
+        if (!opening) {
             Tags.purge(e.getInventory(), SCAN_LIMIT);
         }
     }
@@ -756,6 +812,7 @@ final class Menu implements Listener {
     @EventHandler
     public void onQuit(PlayerQuitEvent e) {
         UUID id = e.getPlayer().getUniqueId();
+        viewers.remove(id);
         lastClick.remove(id);
         searches.remove(id);
         sorts.remove(id);

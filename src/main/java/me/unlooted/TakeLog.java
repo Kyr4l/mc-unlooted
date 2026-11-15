@@ -21,6 +21,8 @@ final class TakeLog {
 
     private final Plugin plugin;
     private final Deque<String> recent = new ArrayDeque<String>();
+    /** Only used on the main thread. */
+    private final SimpleDateFormat time = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
 
     TakeLog(Plugin plugin) {
         this.plugin = plugin;
@@ -28,7 +30,7 @@ final class TakeLog {
 
     void add(String entry) {
         plugin.getLogger().info(entry);
-        recent.addLast(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT).format(new Date()) + "  " + entry);
+        recent.addLast(time.format(new Date()) + "  " + entry);
         while (recent.size() > KEEP) {
             recent.removeFirst();
         }

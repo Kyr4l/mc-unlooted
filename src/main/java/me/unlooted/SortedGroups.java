@@ -1,12 +1,15 @@
 package me.unlooted;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * The storage's items in each sort order, kept up to date one change at a time: a changed item is
@@ -64,6 +67,41 @@ final class SortedGroups implements Storage.Listener {
         for (Map.Entry<Mode, List<Storage.Group>> entry : lists.entrySet()) {
             remove(entry.getValue(), group);
             insert(entry.getValue(), group, comparator(entry.getKey()));
+        }
+    }
+
+    /**
+     * A batch: all changed items are taken out in one pass, then everything is put back with one sort.
+     * The list is already in order apart from the batch, which the sort handles in close to linear time.
+     */
+    @Override
+    public void changed(Collection<Storage.Group> changed, Collection<Storage.Group> added) {
+        if (changed.isEmpty() && added.isEmpty()) {
+            return;
+        }
+        Set<Storage.Group> moved = Collections.newSetFromMap(new IdentityHashMap<Storage.Group, Boolean>());
+        moved.addAll(changed);
+        for (Map.Entry<Mode, List<Storage.Group>> entry : lists.entrySet()) {
+            List<Storage.Group> list = entry.getValue();
+            if (changed.size() + added.size() <= 2) {
+                // Every changed item must be out before any goes back, or a search could meet one out of place.
+                for (Storage.Group group : changed) {
+                    remove(list, group);
+                }
+                for (Storage.Group group : changed) {
+                    insert(list, group, comparator(entry.getKey()));
+                }
+                for (Storage.Group group : added) {
+                    insert(list, group, comparator(entry.getKey()));
+                }
+                continue;
+            }
+            if (!moved.isEmpty()) {
+                list.removeIf(moved::contains);
+            }
+            list.addAll(changed);
+            list.addAll(added);
+            list.sort(comparator(entry.getKey()));
         }
     }
 

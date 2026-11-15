@@ -179,7 +179,7 @@ public class StorageTest {
         add(Material.COBBLESTONE, 104, null, 0);
         add(Material.ARROW, 7, BOB, NOW + 5000);
         YamlConfiguration yml = new YamlConfiguration();
-        yml.set("groups", storage.snapshot());
+        yml.set("groups", storage.snapshot().toData());
         YamlConfiguration back = new YamlConfiguration();
         back.loadFromString(yml.saveToString());
         Storage loaded = new Storage(codec);
@@ -201,7 +201,7 @@ public class StorageTest {
         assertEquals(1, storage.groups().size());
         assertEquals(128, storage.totalItems());
         assertEquals(1, storage.unreadable.size());
-        assertTrue(storage.snapshot().contains("nbt:not-decodable-here"));
+        assertTrue(storage.snapshot().toData().contains("nbt:not-decodable-here"));
     }
 
     /**
@@ -304,6 +304,42 @@ public class StorageTest {
             }
             for (UUID owner : new UUID[] {ALICE, BOB}) {
                 assertEquals("step " + step, bruteReserved(storage, owner, now), storage.reservedFor(owner, now));
+            }
+        }
+    }
+
+    /** Loot sweeps add in batches: the views must match a full re-sort after every batch, whatever its size. */
+    @Test
+    public void batchedAddsKeepSortedListsCorrect() {
+        java.util.Random random = new java.util.Random(7);
+        SortedGroups sorted = new SortedGroups(storage);
+        storage.setListener(sorted);
+        Material[] types = {Material.STONE, Material.DIRT, Material.COBBLESTONE, Material.SAND, Material.GRAVEL, Material.ARROW};
+        UUID[] owners = {null, ALICE, BOB};
+        long now = NOW;
+        for (int step = 0; step < 500; step++) {
+            now += random.nextInt(2000);
+            for (SortedGroups.Mode mode : SortedGroups.Mode.values()) {
+                sorted.get(mode);
+            }
+            if (random.nextInt(4) == 0 && !storage.isEmpty()) {
+                Storage.Group group = storage.groups().get(random.nextInt(storage.groups().size()));
+                storage.take(group, group.lots.get(0), 1 + random.nextInt(80));
+            } else {
+                int adds = 1 + random.nextInt(random.nextBoolean() ? 2 : 30);
+                storage.startBatch();
+                for (int i = 0; i < adds; i++) {
+                    UUID owner = owners[random.nextInt(owners.length)];
+                    storage.add(new ItemStack(types[random.nextInt(types.length)], 1 + random.nextInt(64), (short) random.nextInt(4)),
+                            owner, owner == null ? null : "x", owner == null ? 0 : now + random.nextInt(30_000),
+                            Integer.MAX_VALUE, now, new Storage.Origin("world", 0, 0, 0, now + random.nextInt(5000)));
+                }
+                storage.endBatch();
+            }
+            for (SortedGroups.Mode mode : SortedGroups.Mode.values()) {
+                List<Storage.Group> expected = new ArrayList<Storage.Group>(storage.groups());
+                java.util.Collections.sort(expected, SortedGroups.comparator(mode));
+                assertEquals("step " + step + " " + mode, expected, sorted.get(mode));
             }
         }
     }

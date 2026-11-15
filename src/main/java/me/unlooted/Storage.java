@@ -4,13 +4,16 @@ import org.bukkit.Material;
 import org.bukkit.inventory.ItemStack;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -74,6 +77,8 @@ final class Storage {
         final Object stored;
         final int maxStack;
         final String bucket;
+        /** Readable name, worked out once since reading it means copying the item's data. Null if unknown. */
+        private final String name;
         /** Lower-case name and type, for search. */
         final String searchText;
         final List<Lot> lots = new ArrayList<Lot>();
@@ -84,8 +89,14 @@ final class Storage {
             this.stored = stored;
             this.maxStack = maxStack;
             this.bucket = bucket;
-            this.searchText = (Tags.displayName(template, "") + " " + template.getType().name().replace('_', ' '))
+            this.name = Tags.displayName(template, null);
+            this.searchText = ((name == null ? "" : name) + " " + template.getType().name().replace('_', ' '))
                     .toLowerCase(java.util.Locale.ROOT);
+        }
+
+        /** The item's readable name, or unknown when it has none. */
+        String name(String unknown) {
+            return name == null ? unknown : name;
         }
 
         long lastLooted() {
@@ -124,6 +135,9 @@ final class Storage {
 
         void removed(Group group);
 
+        /** Several changes at once, from a batch: changed groups were already known, added ones are new. */
+        void changed(Collection<Group> changed, Collection<Group> added);
+
         /** Many changes at once: rebuild from scratch. */
         void reset();
     }
@@ -141,8 +155,49 @@ final class Storage {
     /** Goes up on every change, so views can cache sorted lists. */
     private long version;
 
+    /**
+     * Set while a batch of adds runs. Templates' raw data is kept for the batch only, so adding many
+     * stacks of the same item computes it once, and the listener hears about all changes at the end.
+     */
+    private Map<Group, Object> batchPrints;
+    private Set<Group> batchChanged;
+    private Set<Group> batchAdded;
+
     Storage(ItemCodec codec) {
         this.codec = codec;
+    }
+
+    /** Starts a batch of adds. Every startBatch must be followed by endBatch. */
+    void startBatch() {
+        batchPrints = new IdentityHashMap<Group, Object>();
+        batchChanged = Collections.newSetFromMap(new IdentityHashMap<Group, Boolean>());
+        batchAdded = Collections.newSetFromMap(new IdentityHashMap<Group, Boolean>());
+    }
+
+    void endBatch() {
+        Set<Group> changed = batchChanged;
+        Set<Group> added = batchAdded;
+        batchPrints = null;
+        batchChanged = null;
+        batchAdded = null;
+        if (changed == null || listener == null || (changed.isEmpty() && added.isEmpty())) {
+            return;
+        }
+        changed.removeAll(added);
+        // Groups removed while the batch ran (none today) were already reported.
+        List<Group> stillChanged = new ArrayList<Group>();
+        for (Group group : changed) {
+            if (contains(group)) {
+                stillChanged.add(group);
+            }
+        }
+        List<Group> stillAdded = new ArrayList<Group>();
+        for (Group group : added) {
+            if (contains(group)) {
+                stillAdded.add(group);
+            }
+        }
+        listener.changed(stillChanged, stillAdded);
     }
 
     List<Group> groups() {
@@ -242,11 +297,33 @@ final class Storage {
                 fingerprint = codec.fingerprint(one);
                 computed = true;
             }
-            if (codec.sameRawData(group.template, fingerprint)) {
+            if (sameRawData(group, fingerprint)) {
                 return group;
             }
         }
         return null;
+    }
+
+    /**
+     * True when the full raw data of a group's template equals a candidate's, given the candidate's
+     * fingerprint. The template's raw data is computed here instead of being kept in memory (outside a
+     * batch): templates never change, so the result is the same every time. NBT compounds compare by
+     * content, so key order doesn't matter. When raw NBT is unavailable, Bukkit's isSimilar decides.
+     */
+    private boolean sameRawData(Group group, Object candidate) {
+        if (candidate == null) {
+            return true;
+        }
+        Object stored;
+        if (batchPrints != null && batchPrints.containsKey(group)) {
+            stored = batchPrints.get(group);
+        } else {
+            stored = codec.fingerprint(group.template);
+            if (batchPrints != null) {
+                batchPrints.put(group, stored);
+            }
+        }
+        return stored == null || stored.equals(candidate);
     }
 
     private Group newGroup(ItemStack one, Object stored) {
@@ -290,7 +367,9 @@ final class Storage {
         normalize(group, now);
         addLot(group, stack.getAmount(), owner, ownerName, reservedUntil, origin);
         version++;
-        if (listener != null) {
+        if (batchChanged != null) {
+            (created ? batchAdded : batchChanged).add(group);
+        } else if (listener != null) {
             if (created) {
                 listener.added(group);
             } else {
@@ -459,37 +538,89 @@ final class Storage {
 
     // ------------------------------------------------------------------ persistence
 
-    /** Plain data for data.yml: maps, lists, strings and numbers only (plus stacks under Bukkit serialization). */
-    List<Object> snapshot() {
-        List<Object> out = new ArrayList<Object>();
-        for (Group group : groups) {
-            Map<String, Object> entry = new LinkedHashMap<String, Object>();
-            entry.put("item", group.stored);
-            List<Object> lots = new ArrayList<Object>();
-            for (Lot lot : group.lots) {
-                Map<String, Object> l = new LinkedHashMap<String, Object>();
-                l.put("amount", lot.amount);
-                if (lot.owner != null) {
-                    l.put("owner", lot.owner.toString());
-                    l.put("owner-name", lot.ownerName);
-                    l.put("reserved-until", lot.reservedUntil);
-                }
-                if (lot.last != null) {
-                    l.put("looted-at", lot.last.time);
-                    if (lot.last.world != null) {
-                        l.put("world", lot.last.world);
-                        l.put("x", lot.last.x);
-                        l.put("y", lot.last.y);
-                        l.put("z", lot.last.z);
-                    }
-                }
-                lots.add(l);
+    /**
+     * A copy of the storage taken at one moment, cheap to take on the main thread. Everything it refers
+     * to never changes (stored forms, owners, origins), so it can be turned into data on any thread.
+     */
+    static final class Snapshot {
+        private final Object[] stored;
+        /** Lot count of each group, in order; the lots themselves follow one after another. */
+        private final int[] lotCounts;
+        private final long[] amounts;
+        private final UUID[] owners;
+        private final String[] ownerNames;
+        private final long[] reservedUntil;
+        private final Origin[] origins;
+        private final Object[] unreadable;
+
+        private Snapshot(List<Group> groups, List<Object> unreadable) {
+            int lots = 0;
+            for (Group group : groups) {
+                lots += group.lots.size();
             }
-            entry.put("lots", lots);
-            out.add(entry);
+            stored = new Object[groups.size()];
+            lotCounts = new int[groups.size()];
+            amounts = new long[lots];
+            owners = new UUID[lots];
+            ownerNames = new String[lots];
+            reservedUntil = new long[lots];
+            origins = new Origin[lots];
+            int g = 0;
+            int l = 0;
+            for (Group group : groups) {
+                stored[g] = group.stored;
+                lotCounts[g] = group.lots.size();
+                g++;
+                for (Lot lot : group.lots) {
+                    amounts[l] = lot.amount;
+                    owners[l] = lot.owner;
+                    ownerNames[l] = lot.ownerName;
+                    reservedUntil[l] = lot.reservedUntil;
+                    origins[l] = lot.last;
+                    l++;
+                }
+            }
+            this.unreadable = unreadable.toArray();
         }
-        out.addAll(unreadable);
-        return out;
+
+        /** Plain data for data.yml: maps, lists, strings and numbers only (plus stacks under Bukkit serialization). */
+        List<Object> toData() {
+            List<Object> out = new ArrayList<Object>(stored.length + unreadable.length);
+            int l = 0;
+            for (int g = 0; g < stored.length; g++) {
+                Map<String, Object> entry = new LinkedHashMap<String, Object>();
+                entry.put("item", stored[g]);
+                List<Object> lots = new ArrayList<Object>(lotCounts[g]);
+                for (int end = l + lotCounts[g]; l < end; l++) {
+                    Map<String, Object> lot = new LinkedHashMap<String, Object>();
+                    lot.put("amount", amounts[l]);
+                    if (owners[l] != null) {
+                        lot.put("owner", owners[l].toString());
+                        lot.put("owner-name", ownerNames[l]);
+                        lot.put("reserved-until", reservedUntil[l]);
+                    }
+                    Origin last = origins[l];
+                    if (last != null) {
+                        lot.put("looted-at", last.time);
+                        if (last.world != null) {
+                            lot.put("world", last.world);
+                            lot.put("x", last.x);
+                            lot.put("y", last.y);
+                            lot.put("z", last.z);
+                        }
+                    }
+                    lots.add(lot);
+                }
+                entry.put("lots", lots);
+                out.add(entry);
+            }
+            Collections.addAll(out, unreadable);
+            return out;
+        }
+    }
+
+    Snapshot snapshot() {
+        return new Snapshot(groups, unreadable);
     }
 
     /** Loads groups saved by 0.3.0+, and loose item lists saved by earlier versions. */

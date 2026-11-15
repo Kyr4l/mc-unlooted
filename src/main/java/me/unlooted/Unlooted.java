@@ -3,6 +3,7 @@ package me.unlooted;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
 import org.bukkit.Location;
+import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
@@ -174,6 +175,8 @@ public class Unlooted extends JavaPlugin implements Listener {
     private boolean ignoreUnpickupable;
     private Set<String> excludedWorlds = new HashSet<String>();
     private List<Pattern> excludedItems = new ArrayList<Pattern>();
+    /** excluded-items results by type. A HashMap, since mods can add types after startup. */
+    private final Map<Material, Boolean> excludedTypes = new HashMap<Material, Boolean>();
     private String broadcastMessage;
 
     private File dataFile;
@@ -263,6 +266,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             items.add(glob(item));
         }
         excludedItems = items;
+        excludedTypes.clear();
 
         long newInterval = Math.max(1, getConfig().getLong("loot-interval-seconds", 60)) * 20L;
         if (sweepTask == null || newInterval != intervalTicks) {
@@ -296,7 +300,7 @@ public class Unlooted extends JavaPlugin implements Listener {
             menu.closeAll();
         }
         long now = System.currentTimeMillis();
-        dropGoneTimers();
+        dropGoneTimers(0, now);
         for (Timer t : timers.values()) {
             t.advance(now);
             t.paused = true;
@@ -333,23 +337,37 @@ public class Unlooted extends JavaPlugin implements Listener {
 
     // ------------------------------------------------------------------ per-item timers and owners
 
-    @SuppressWarnings("deprecation")
     private boolean ignored(Item item) {
+        return excludedWorld(item.getWorld()) || ignoredInWorld(item);
+    }
+
+    /** The checks that don't depend on the world, for items of a world already known not to be excluded. */
+    private boolean ignoredInWorld(Item item) {
         if (ignoreUnpickupable && item.getPickupDelay() >= INFINITE_PICKUP_DELAY) {
             return true;
         }
-        if (!excludedWorlds.isEmpty() && excludedWorlds.contains(item.getWorld().getName().toLowerCase(Locale.ROOT))) {
-            return true;
-        }
-        if (!excludedItems.isEmpty()) {
-            String type = item.getItemStack().getType().name();
+        return !excludedItems.isEmpty() && excludedType(item.getItemStack().getType());
+    }
+
+    private boolean excludedWorld(World world) {
+        return !excludedWorlds.isEmpty() && excludedWorlds.contains(world.getName().toLowerCase(Locale.ROOT));
+    }
+
+    /** Whether excluded-items matches a type, worked out once per type until the config changes. */
+    private boolean excludedType(Material type) {
+        Boolean cached = excludedTypes.get(type);
+        if (cached == null) {
+            cached = false;
+            String name = type.name();
             for (Pattern pattern : excludedItems) {
-                if (pattern.matcher(type).matches()) {
-                    return true;
+                if (pattern.matcher(name).matches()) {
+                    cached = true;
+                    break;
                 }
             }
+            excludedTypes.put(type, cached);
         }
-        return false;
+        return cached;
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
@@ -463,8 +481,17 @@ public class Unlooted extends JavaPlugin implements Listener {
         }
     }
 
+    /** Hoppers under a pile of items fire this constantly, so the timer is reset in place. */
     private void restart(Item item) {
-        timers.put(item.getUniqueId(), new Timer(0, System.currentTimeMillis(), false));
+        long now = System.currentTimeMillis();
+        Timer t = timers.get(item.getUniqueId());
+        if (t == null) {
+            timers.put(item.getUniqueId(), new Timer(0, now, false));
+        } else {
+            t.ageMs = 0;
+            t.lastUpdate = now;
+            t.paused = false;
+        }
     }
 
     /** Items of different owners never merge, so a reservation always covers exactly its owner's items. */
@@ -499,16 +526,6 @@ public class Unlooted extends JavaPlugin implements Listener {
         e.setCancelled(true);
     }
 
-    @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onChunkUnload(ChunkUnloadEvent e) {
-        long now = System.currentTimeMillis();
-        for (Entity entity : e.getChunk().getEntities()) {
-            if (entity instanceof Item) {
-                pause(entity.getUniqueId(), now);
-            }
-        }
-    }
-
     /** Stops the timer of an item whose chunk or entity section is unloading. */
     private void pause(UUID id, long now) {
         Timer t = timers.get(id);
@@ -523,19 +540,47 @@ public class Unlooted extends JavaPlugin implements Listener {
      * exist in the 1.12 API this plugin compiles against, so they are found and registered by reflection.
      */
     private void registerEntityEvents() {
-        registerEntitiesEvent("org.bukkit.event.world.EntitiesUnloadEvent", true);
-        registerEntitiesEvent("org.bukkit.event.world.EntitiesLoadEvent", false);
+        boolean unload = registerEntitiesEvent("org.bukkit.event.world.EntitiesUnloadEvent", true);
+        boolean load = registerEntitiesEvent("org.bukkit.event.world.EntitiesLoadEvent", false);
+        if (!unload || !load) {
+            // Before 1.17 entities load with their chunk. Since 1.17 asking a chunk for its entities can
+            // make the main thread wait for them to load from disk, so the chunk events are only used here.
+            getServer().getPluginManager().registerEvents(new ChunkListener(), this);
+        }
+    }
+
+    /** Pauses and resumes item timers with their chunk, on servers older than 1.17. */
+    private final class ChunkListener implements Listener {
+        @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
+        public void onChunkUnload(ChunkUnloadEvent e) {
+            long now = System.currentTimeMillis();
+            for (Entity entity : e.getChunk().getEntities()) {
+                if (entity instanceof Item) {
+                    pause(entity.getUniqueId(), now);
+                }
+            }
+        }
+
+        @EventHandler(priority = EventPriority.MONITOR)
+        public void onChunkLoad(ChunkLoadEvent e) {
+            long now = System.currentTimeMillis();
+            for (Entity entity : e.getChunk().getEntities()) {
+                if (entity instanceof Item) {
+                    resume(entity.getUniqueId(), now);
+                }
+            }
+        }
     }
 
     @SuppressWarnings("unchecked")
-    private void registerEntitiesEvent(String className, final boolean unload) {
+    private boolean registerEntitiesEvent(String className, final boolean unload) {
         final Class<? extends Event> type;
         final Method getEntities;
         try {
             type = (Class<? extends Event>) Class.forName(className);
             getEntities = type.getMethod("getEntities");
         } catch (Throwable t) {
-            return;
+            return false;
         }
         getServer().getPluginManager().registerEvent(type, this, EventPriority.MONITOR, (listener, event) -> {
             if (!type.isInstance(event)) {
@@ -559,16 +604,7 @@ public class Unlooted extends JavaPlugin implements Listener {
                 }
             }
         }, this, true);
-    }
-
-    @EventHandler(priority = EventPriority.MONITOR)
-    public void onChunkLoad(ChunkLoadEvent e) {
-        long now = System.currentTimeMillis();
-        for (Entity entity : e.getChunk().getEntities()) {
-            if (entity instanceof Item) {
-                resume(entity.getUniqueId(), now);
-            }
-        }
+        return true;
     }
 
     /** Starts or resumes the timer of an item seen in a loaded chunk. */
@@ -599,8 +635,11 @@ public class Unlooted extends JavaPlugin implements Listener {
         List<Item> due = new ArrayList<Item>();
 
         for (World world : Bukkit.getWorlds()) {
+            if (excludedWorld(world)) {
+                continue;
+            }
             for (Item item : world.getEntitiesByClass(Item.class)) {
-                if (!item.isValid() || ignored(item)) {
+                if (!item.isValid() || ignoredInWorld(item)) {
                     continue;
                 }
                 UUID id = item.getUniqueId();
@@ -645,32 +684,37 @@ public class Unlooted extends JavaPlugin implements Listener {
         int count = 0;
         int stacks = 0;
         Map<UUID, Long> reservedPerOwner = new HashMap<UUID, Long>();
-        for (Item item : due) {
-            ItemStack stack = item.getItemStack();
-            UUID id = item.getUniqueId();
-            if (stack == null || stack.getAmount() <= 0 || Tags.isTagged(stack)) {
-                timers.remove(id);
-                forgetOwner(id);
-                item.remove();
-                continue;
-            }
-            Owner owner = priorityMs > 0 ? owners.get(id) : null;
-            Location at = item.getLocation();
-            Storage.Origin origin = new Storage.Origin(at.getWorld().getName(), at.getBlockX(), at.getBlockY(), at.getBlockZ(), now);
-            boolean stored = storage.add(stack.clone(), owner == null ? null : owner.id, owner == null ? null : owner.name,
-                    owner == null ? 0 : now + priorityMs, maxGroups, now, origin);
-            if (stored) {
-                count += stack.getAmount();
-                stacks++;
-                if (owner != null) {
-                    Long before = reservedPerOwner.get(owner.id);
-                    reservedPerOwner.put(owner.id, (before == null ? 0 : before) + stack.getAmount());
+        storage.startBatch();
+        try {
+            for (Item item : due) {
+                ItemStack stack = item.getItemStack();
+                UUID id = item.getUniqueId();
+                if (stack == null || stack.getAmount() <= 0 || Tags.isTagged(stack)) {
+                    timers.remove(id);
+                    forgetOwner(id);
+                    item.remove();
+                    continue;
                 }
-                timers.remove(id);
-                forgetOwner(id);
-                item.remove();
+                Owner owner = priorityMs > 0 ? owners.get(id) : null;
+                Location at = item.getLocation();
+                Storage.Origin origin = new Storage.Origin(at.getWorld().getName(), at.getBlockX(), at.getBlockY(), at.getBlockZ(), now);
+                boolean stored = storage.add(stack, owner == null ? null : owner.id, owner == null ? null : owner.name,
+                        owner == null ? 0 : now + priorityMs, maxGroups, now, origin);
+                if (stored) {
+                    count += stack.getAmount();
+                    stacks++;
+                    if (owner != null) {
+                        Long before = reservedPerOwner.get(owner.id);
+                        reservedPerOwner.put(owner.id, (before == null ? 0 : before) + stack.getAmount());
+                    }
+                    timers.remove(id);
+                    forgetOwner(id);
+                    item.remove();
+                }
+                // Otherwise max-pages is reached and the item needs a new entry: it stays on the ground.
             }
-            // Otherwise max-pages is reached and the item needs a new entry: it stays on the ground.
+        } finally {
+            storage.endBatch();
         }
         if (count > 0) {
             markDirty();
@@ -1169,50 +1213,80 @@ public class Unlooted extends JavaPlugin implements Listener {
         if (storageBroken) {
             return;
         }
-        final Map<String, Object> root = new LinkedHashMap<String, Object>();
-        root.put("format", 2);
-        root.put("groups", storage.snapshot());
-        long now = System.currentTimeMillis();
+        // Only a copy of the state is taken here, on the main thread. Turning it into YAML maps and text,
+        // the expensive part, happens in the background.
+        final Storage.Snapshot groups = storage.snapshot();
+        final long now = System.currentTimeMillis();
         // Only timers that are worth keeping across a restart are written. An item without a saved timer
         // just starts waiting again, so dropping the young ones costs at most half the delay, while a busy
         // farm that machines empty all day would otherwise fill the file with thousands of dead timers.
-        dropGoneTimers();
+        // Only those timers need checking for gone items here: the sweep forgets the others.
         long keepFrom = delayMs / 2;
-        Map<String, Object> timerData = new LinkedHashMap<String, Object>();
+        dropGoneTimers(keepFrom, now);
+        final int timerCount = timers.size();
+        final UUID[] timerIds = new UUID[timerCount];
+        final long[] timerAges = new long[timerCount];
+        int t = 0;
         for (Map.Entry<UUID, Timer> entry : timers.entrySet()) {
             long age = entry.getValue().current(now);
             if (age >= keepFrom) {
-                timerData.put(entry.getKey().toString(), age);
+                timerIds[t] = entry.getKey();
+                timerAges[t] = age;
+                t++;
             }
         }
-        root.put("timers", timerData);
-        Map<String, Object> ownerData = new LinkedHashMap<String, Object>();
+        final int keptTimers = t;
+        final int ownerCount = owners.size();
+        final UUID[] ownerItems = new UUID[ownerCount];
+        final Owner[] ownerOf = new Owner[ownerCount];
+        final long[] ownerSeenAt = new long[ownerCount];
+        int o = 0;
         for (Map.Entry<UUID, Owner> entry : owners.entrySet()) {
-            Map<String, Object> o = new LinkedHashMap<String, Object>();
-            o.put("owner", entry.getValue().id.toString());
-            o.put("owner-name", entry.getValue().name);
+            ownerItems[o] = entry.getKey();
+            ownerOf[o] = entry.getValue();
             Long seenAt = ownerSeen.get(entry.getKey());
-            o.put("seen", seenAt == null ? now : seenAt);
-            ownerData.put(entry.getKey().toString(), o);
+            ownerSeenAt[o] = seenAt == null ? now : seenAt;
+            o++;
         }
-        root.put("owners", ownerData);
         dirty = false;
         final long seq = ++saveSeq;
-        if (sync || !codec.isLossless()) {
+        Runnable task = () -> {
+            Map<String, Object> root = new LinkedHashMap<String, Object>();
+            root.put("format", 2);
+            root.put("groups", groups.toData());
+            Map<String, Object> timerData = new LinkedHashMap<String, Object>();
+            for (int i = 0; i < keptTimers; i++) {
+                timerData.put(timerIds[i].toString(), timerAges[i]);
+            }
+            root.put("timers", timerData);
+            Map<String, Object> ownerData = new LinkedHashMap<String, Object>();
+            for (int i = 0; i < ownerCount; i++) {
+                Map<String, Object> entry = new LinkedHashMap<String, Object>();
+                entry.put("owner", ownerOf[i].id.toString());
+                entry.put("owner-name", ownerOf[i].name);
+                entry.put("seen", ownerSeenAt[i]);
+                ownerData.put(ownerItems[i].toString(), entry);
+            }
+            root.put("owners", ownerData);
             write(seq, dump(root));
+        };
+        if (sync || !codec.isLossless()) {
+            task.run();
         } else {
-            getServer().getScheduler().runTaskAsynchronously(this, () -> write(seq, dump(root)));
+            getServer().getScheduler().runTaskAsynchronously(this, task);
         }
     }
 
     /**
-     * Forgets the timers of items in loaded chunks that no longer exist, such as items a machine took.
-     * Items in unloaded chunks keep their (paused) timer, since they still exist. Main thread only.
+     * Forgets the timers of items in loaded chunks that no longer exist, such as items a machine took,
+     * among timers at least minAge old. Items in unloaded chunks keep their (paused) timer, since they
+     * still exist. Main thread only.
      */
-    private void dropGoneTimers() {
+    private void dropGoneTimers(long minAge, long now) {
         for (Iterator<Map.Entry<UUID, Timer>> it = timers.entrySet().iterator(); it.hasNext(); ) {
             Map.Entry<UUID, Timer> entry = it.next();
-            if (!entry.getValue().paused && Bukkit.getEntity(entry.getKey()) == null) {
+            Timer timer = entry.getValue();
+            if (!timer.paused && timer.current(now) >= minAge && Bukkit.getEntity(entry.getKey()) == null) {
                 it.remove();
             }
         }

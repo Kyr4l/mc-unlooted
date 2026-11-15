@@ -150,20 +150,6 @@ class ItemCodec {
         }
     }
 
-    /**
-     * True when the full raw data of a stored template equals a candidate's, given the candidate's
-     * fingerprint. The template's raw data is computed here instead of being kept in memory: templates
-     * never change, so the result is the same every time. NBT compounds compare by content, so key
-     * order doesn't matter. When raw NBT is unavailable, Bukkit's isSimilar (checked by the caller) decides.
-     */
-    boolean sameRawData(ItemStack template, Object candidateFingerprint) {
-        if (candidateFingerprint == null) {
-            return true;
-        }
-        Object stored = fingerprint(template);
-        return stored == null || stored.equals(candidateFingerprint);
-    }
-
     /** How many of this item fit in one stack, asking the server itself when possible. */
     int maxStackSize(ItemStack stack) {
         if (nmsMaxStack != null && asNmsCopy != null) {
